@@ -84,6 +84,14 @@ EPS_HARD_FAULT_DISENGAGE_FRAMES = 3
 # disengages openpilot.
 ACC_FAULT_DEBOUNCE_FRAMES = 50
 
+# After every car start the ADAS reports ACC as Failure_irreversible (10) until it has taken the
+# 0x52A spoof, and often until the car has been through P once: 10 to 35 s, through D shifts too
+# (2026-11-13 routes 0000000d, 00000012). Until ACC has reached Standby once since openpilot
+# started, 9/10 means "still starting": unavailable, not a fault. If it never comes up, it is a
+# fault after this long in a forward gear.
+ACC_STARTUP_GRACE_FRAMES = 6000  # 60 s
+ACC_READY_STATES = (2, 3, 4, 5, 6, 7, 8, 11)  # Standby and every state past it
+
 
 # Every signal in ICC_0x52A. Enumerated once here so carstate snapshots the whole frame
 # and the carcontroller can round-trip it into the spoofed packet with only
@@ -236,6 +244,8 @@ class CarState(CarStateBase):
     self._params = None               # lazily constructed on first write
     self._prev_cc_state = 0           # tracks ADAS_Sts_ACC_ICC for cruise→Off reset edge
     self._acc_failure_frames = 0      # consecutive updates with ACC in a Failure state (9/10)
+    self._acc_ready_seen = False      # ACC has reached Standby (or beyond) since openpilot started
+    self._acc_startup_frames = 0      # updates in a forward gear with ACC failing before it was ever ready
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
@@ -496,9 +506,14 @@ class CarState(CarStateBase):
     # if engaged. The count restarts outside D so that tail gets the full debounce too.
     not_forward = ret.gearShifter in (GearShifter.reverse, GearShifter.park, GearShifter.neutral)
     acc_failure = cc_state in (9, 10) or vcu_cc_state in (9, 10)
-    self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not not_forward else 0
+    if cc_state in ACC_READY_STATES or vcu_cc_state in (2, 3, 4):
+      self._acc_ready_seen = True
+    if acc_failure and not not_forward and not self._acc_ready_seen:
+      self._acc_startup_frames += 1
+    acc_starting = not self._acc_ready_seen and self._acc_startup_frames < ACC_STARTUP_GRACE_FRAMES
+    self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not not_forward and not acc_starting else 0
     acc_failure_confirmed = self._acc_failure_frames >= ACC_FAULT_DEBOUNCE_FRAMES
-    unavailable = (0, 1, 9, 10) if acc_failure_confirmed or not_forward else (0, 1)
+    unavailable = (0, 1, 9, 10) if acc_failure_confirmed or not_forward or acc_starting else (0, 1)
 
     adas_enabled = cc_state in (3, 4, 5, 6, 11)
     adas_available = cc_state not in unavailable

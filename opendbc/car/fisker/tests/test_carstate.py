@@ -9,7 +9,7 @@ import unittest
 from opendbc.can import CANPacker
 from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
-from opendbc.car.fisker.carstate import ACC_FAULT_DEBOUNCE_FRAMES, CarState
+from opendbc.car.fisker.carstate import ACC_FAULT_DEBOUNCE_FRAMES, ACC_STARTUP_GRACE_FRAMES, CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import CANBUS, CAR, DBC
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
@@ -221,6 +221,27 @@ class TestCarstate(unittest.TestCase):
     out += _feed_acc(CS, parsers, packer, [10] * 10 + [0] * 4 + [1] * 10 + [2] * 10, gear=4)
     assert not any(faulted for _, faulted in out)
     assert not out[409][0]  # unavailable while in R
+
+  def test_failure_after_start_is_not_a_fault(self):
+    # After a car start ACC sits in 10 until the ADAS has taken the 0x52A spoof, through D, R and P
+    # (2026-11-13 route 00000012): still starting, so unavailable but not a fault, until it has
+    # reached Standby once. From then on a persistent failure is a fault again.
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [10] * 900, gear=4)
+    out += _feed_acc(CS, parsers, packer, [10] * 400, gear=3)
+    out += _feed_acc(CS, parsers, packer, [10] * 300, gear=4)
+    out += _feed_acc(CS, parsers, packer, [0] * 10 + [1] * 10, gear=1)
+    assert all(not avail and not faulted for avail, faulted in out), out
+    out = _feed_acc(CS, parsers, packer, [2] * 10 + [10] * ACC_FAULT_DEBOUNCE_FRAMES, gear=4)
+    assert out[9] == (True, False)
+    assert out[-1] == (False, True)
+
+  def test_failure_that_never_clears_after_start_is_a_fault(self):
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [10] * 3000, gear=1)  # time in P doesn't use up the grace
+    out += _feed_acc(CS, parsers, packer, [10] * (ACC_STARTUP_GRACE_FRAMES + ACC_FAULT_DEBOUNCE_FRAMES - 1), gear=4)
+    assert not any(faulted for _, faulted in out[:-1])
+    assert out[-1] == (False, True)
 
   def test_secoc_full_counter_restarts_cleanly_across_reset(self):
     # The OEM 0x1D0 counter runs 1..102 per window (wire 1..63, wrap to 0..38), then the
