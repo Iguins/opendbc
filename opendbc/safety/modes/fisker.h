@@ -254,7 +254,51 @@ static uint8_t fisker_crc8_j1850(uint8_t data_id, const uint8_t *data, int len) 
   return crc;
 }
 
-static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
+// ---- Blind-spot dropout tracker (ADAS_0x314, bus 2 -> car) ---------------------------------
+// A rear corner radar drops out for ~2 s at a time (CMRR_RL DTC "MRR - E2E Validation Error"),
+// taking BSD (ADAS_BSDSts 4=Error), DOW (ADAS_DOW_Sts 4=Off_fault) and LCA (ADAS_LCA_Sts 7=Error)
+// down with it, several times a minute in D and in P (2026-11-13 routes 09 and 0b). Each time the
+// ADAS lights the yellow ADAS fault telltale (ADAS_SysFltWarnReq=1) for the dropout and shows
+// "BSM/ELKA system fault" (ADAS_IDS_WarnTxtReq=13) with the fault chime, the text staying up ~3 s
+// after it. The dash warning filter below hides those while the dropout is transient (under
+// FISKER_BSD_FAIL_TRANSIENT_US). A dropout that persists shows its text and telltale again, and
+// ADAS_0x314 itself reaches the car unchanged.
+#define FISKER_BSD_FAIL_TRANSIENT_US  20000000U  // a dropout longer than this is real
+#define FISKER_BSD_TELLTALE_HIDE_US    1000000U  // the telltale clears with the dropout
+#define FISKER_BSD_TEXT_HIDE_US        5000000U  // the text can start after the dropout ends
+#define FISKER_BSD_FAULT_TEXT          13U       // ADAS_IDS_WarnTxtReq BSM_ELKA_System_fault
+static bool fisker_bsd_failing = false;
+static uint32_t fisker_bsd_fail_start = 0U;
+static bool fisker_bsd_hideable = false;          // the current/last dropout is transient
+static uint32_t fisker_bsd_hide_last = 0U;        // last time a transient dropout was observed
+static bool fisker_bsd_text_hiding = false;       // latched over one continuous BSM/ELKA fault text
+
+static void fisker_update_bsd_filter(const CANPacket_t *msg) {
+  uint32_t now = microsecond_timer_get();
+  uint8_t lca = (msg->data[3] >> 3) & 0x0FU;  // ADAS_LCA_Sts 30|4
+  uint8_t dow = (msg->data[5] >> 3) & 0x07U;  // ADAS_DOW_Sts 45|3
+  uint8_t bsd = msg->data[6] & 0x07U;         // ADAS_BSDSts 50|3
+  bool failing = (bsd == 4U) || (dow == 4U) || (lca == 7U);
+  if (failing && !fisker_bsd_failing) {
+    fisker_bsd_fail_start = now;
+  }
+  fisker_bsd_failing = failing;
+  if (failing && (safety_get_ts_elapsed(now, fisker_bsd_fail_start) < FISKER_BSD_FAIL_TRANSIENT_US)) {
+    fisker_bsd_hideable = true;
+    fisker_bsd_hide_last = now;
+  } else if (failing) {
+    // a real dropout: let its warnings through, including a text we were already hiding
+    fisker_bsd_hideable = false;
+    fisker_bsd_text_hiding = false;
+  } else {
+  }
+}
+
+static bool fisker_bsd_hide_active(uint32_t window_us) {
+  return fisker_bsd_hideable && (safety_get_ts_elapsed(microsecond_timer_get(), fisker_bsd_hide_last) < window_us);
+}
+
+static void fisker_filter_dash_warnings(CANPacket_t *to_send) {
   uint8_t chime = (to_send->data[2] >> 3) & 0x1FU;   // ADAS_ChimeReq 23|5
   uint8_t text = to_send->data[3] & 0x3FU;           // ADAS_IDS_WarnTxtReq 29|6
   uint8_t telltale = (to_send->data[5] >> 6) & 0x03U;  // ADAS_SysFltWarnReq 47|2
@@ -266,11 +310,18 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
     fisker_acc_fault_text_hiding = true;
   } else {
   }
-  if (fisker_acc_fault_text_hiding) {
+  if (text != FISKER_BSD_FAULT_TEXT) {
+    fisker_bsd_text_hiding = false;
+  } else if (fisker_bsd_hide_active(FISKER_BSD_TEXT_HIDE_US)) {
+    fisker_bsd_text_hiding = true;
+  } else {
+  }
+  if (fisker_acc_fault_text_hiding || fisker_bsd_text_hiding) {
     to_send->data[3] &= 0xC0U;
     modified = true;
   }
-  if ((telltale == 1U) && fisker_acc_fault_hide_active(FISKER_ACC_TELLTALE_HIDE_US)) {
+  if ((telltale == 1U) && (fisker_acc_fault_hide_active(FISKER_ACC_TELLTALE_HIDE_US) ||
+                           fisker_bsd_hide_active(FISKER_BSD_TELLTALE_HIDE_US))) {
     to_send->data[5] &= 0x3FU;
     modified = true;
   }
@@ -280,6 +331,30 @@ static void fisker_filter_acc_fault_warning(CANPacket_t *to_send) {
   }
   if (modified) {
     to_send->data[0] = fisker_crc8_j1850(FISKER_0x317_DATA_ID, &to_send->data[1], 7);
+  }
+}
+
+// ---- LKA "warning only" telltale filter (0x31A, bus 2 -> cluster) --------------------------
+// openpilot's 0x52A copy sets ICC_LKASetting to Warning_only (values.ICC_0x52A_OVERRIDES) so the
+// ADAS never steers, only openpilot does. The ADAS then lights the amber LKA telltale
+// (ADAS_ELKA_TelltaleReq 2, ELKA_LKA_Fault_Degraded), exactly as when the driver picks Warning only
+// on the head unit (2026-11-13 route 00000012). fisker_fwd_modify clears that request while the
+// ADAS is getting our copy with Warning_only and its LKA reports no error (ADAS_LKASts 8). A real
+// LKA error and every other telltale reach the cluster unchanged.
+#define FISKER_LKA_SETTING_WARNING_ONLY  1U
+#define FISKER_LKA_STS_ERROR             8U       // ADAS_LKASts LKA_Error
+#define FISKER_ELKA_TELLTALE_DEGRADED    2U       // ADAS_ELKA_TelltaleReq ELKA_LKA_Fault_Degraded
+#define FISKER_0x31A_DATA_ID             55U      // E2E DataID of ADAS_0x31A
+#define FISKER_LKA_SETTING_UNKNOWN       0xFFU
+static uint8_t fisker_icc_lka_setting_sent = FISKER_LKA_SETTING_UNKNOWN;  // ICC_LKASetting in our last 0x52A
+static uint8_t fisker_lka_sts = 0U;               // ADAS_LKASts, from ADAS_0x314
+
+static void fisker_filter_lka_telltale(CANPacket_t *to_send) {
+  uint8_t telltale = (to_send->data[7] >> 6) & 0x03U;  // ADAS_ELKA_TelltaleReq 63|2
+  if ((telltale == FISKER_ELKA_TELLTALE_DEGRADED) && fisker_icc_relay_active() &&
+      (fisker_icc_lka_setting_sent == FISKER_LKA_SETTING_WARNING_ONLY) && (fisker_lka_sts != FISKER_LKA_STS_ERROR)) {
+    to_send->data[7] &= 0x3FU;
+    to_send->data[0] = fisker_crc8_j1850(FISKER_0x31A_DATA_ID, &to_send->data[1], 7);
   }
 }
 
@@ -593,6 +668,7 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
   // whether the ICC's own 0x52A should still be blocked bus 0 -> bus 2.
   if ((msg->addr == 0x52AU) && (msg->bus == 2U)) {
     fisker_icc_settings_tx_last = microsecond_timer_get();
+    fisker_icc_lka_setting_sent = msg->data[2] & 0x03U;  // ICC_LKASetting 17|2
   }
   // ICC_0x35B settings relay (bus 2): record the TX timestamp so the fwd_hook knows
   // whether the ICC's own 0x35B should still be blocked bus 0 -> bus 2.
@@ -623,7 +699,14 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
     fisker_update_acc_fault_filter();
   }
   if ((to_send->addr == 0x317U) && (to_send->bus == 2U)) {
-    fisker_filter_acc_fault_warning(to_send);
+    fisker_filter_dash_warnings(to_send);
+  }
+  if ((to_send->addr == 0x314U) && (to_send->bus == 2U)) {
+    fisker_lka_sts = (to_send->data[2] >> 4) & 0x0FU;  // ADAS_LKASts 23|4
+    fisker_update_bsd_filter(to_send);
+  }
+  if ((to_send->addr == 0x31AU) && (to_send->bus == 2U)) {
+    fisker_filter_lka_telltale(to_send);
   }
   // ICC_0x531 (bus 0 -> ADAS): the dash unit, for the 0x362 fix-up. ICC_DispVehSpdUnit 48|1.
   if ((to_send->addr == 0x531U) && (to_send->bus == 0U)) {
@@ -721,6 +804,13 @@ static safety_config fisker_init(uint16_t param) {
   fisker_acc_fault_hideable = false;
   fisker_acc_fault_hide_last = 0U;
   fisker_acc_fault_text_hiding = false;
+  fisker_bsd_failing = false;
+  fisker_bsd_fail_start = 0U;
+  fisker_bsd_hideable = false;
+  fisker_bsd_hide_last = 0U;
+  fisker_bsd_text_hiding = false;
+  fisker_icc_lka_setting_sent = FISKER_LKA_SETTING_UNKNOWN;
+  fisker_lka_sts = 0U;
   fisker_east_prev = false;
   fisker_east_as_cancel = false;
   fisker_south_held = 0U;

@@ -274,9 +274,12 @@ class TestIccSpoof(unittest.TestCase):
     _, spoofed, spoofed_bus = fcan.create_icc_spoof_0x52a(vals, terrain_setting=True)
     assert spoofed_bus == CANBUS.cam
 
-    # Only byte 0 (checksum patch) and byte 4 (full ACC overrides) should differ.
+    # Only byte 0 (checksum patch), byte 4 (full ACC overrides) and byte 2's ICC_LKASetting bits
+    # (forced to Warning_only so only openpilot steers) should differ.
     differing = [i for i in range(8) if spoofed[i] != oem_frame[i]]
-    assert differing == [0, 4], f"unexpected byte changes: {differing}"
+    assert differing == [0, 2, 4], f"unexpected byte changes: {differing}"
+    assert (spoofed[2] ^ oem_frame[2]) & ~0x03 == 0, "only ICC_LKASetting (17|2) may change in byte 2"
+    assert spoofed[2] & 0x03 == 1
     # Byte 4 is a constant 0x5B regardless of OEM — all five bit-fields overridden.
     assert spoofed[4] == 0x5B
 

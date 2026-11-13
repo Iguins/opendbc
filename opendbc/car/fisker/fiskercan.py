@@ -30,6 +30,7 @@ E2E_PARAMS: dict[int, tuple[int, int]] = {
   0x121: (23, 32),    # ADAS accel command (SecOC)
   0x1C0: (195, 64),   # ADAS lateral-control activation/status
   0x1D0: (16, 32),    # ADAS steering command (SecOC)
+  0x314: (78, 64),    # ADAS LKA/LCA/DOW/BSD status (FM29 ADASBUS matrix V390.1)
   0x317: (205, 64),   # ADAS chime / takeover
   0x318: (121, 64),   # ESP vehicle speed
   0x31A: (55, 64),    # ADAS AEB / telltale

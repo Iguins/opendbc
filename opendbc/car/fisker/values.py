@@ -145,6 +145,9 @@ ICC_0x52A_OVERRIDES: dict[str, float] = {
   "ICCACCFuncTyp": 2,             # 0=Default 1=Basic 2=Advanced 3=ISA
   "ICCACCSpdStepSize": 1,         # 0=Step_1_unit 1=Step_5_unit
   "ICCLaneTrajectorySetting": 1,  # 0=Off 1=On
+  "ICC_LKASetting": 1,            # 0=Off 1=Warning_only 2=Warning_and_Steering -- the ADAS never steers,
+  #                                 only openpilot does; the panda hides the amber telltale this lights
+  #                                 (fisker.h, LKA "warning only" telltale filter)
   # "ICCACCAutoSpdSts": 1,          # 0=Off 1=On -- set speed follows the speed limit
   # "ICCACCTerrainSetting": 0,      # 0=Not_enabled 1=Enabled
   # "ICCACCSpdLimOffsTyp": 1,       # 0=Exceeding_limit_not_allowed 1=Percentage 2=Speed_value
