@@ -171,7 +171,9 @@ assert not (ICC_0x52A_OVERRIDES.keys() & ICC_0x52A_PASSTHROUGH), "ICC_0x52A pass
 # frame to the ADAS module (bus 2) with these signals replaced; everything else, including the
 # undocumented bits, passes through unchanged. Raw values; names from the DBC VAL_ tables.
 ICC_0x35B_OVERRIDES: dict[str, int] = {
-  "ICC_EnbLnChgAsst": 1,          # 0=Auto_steer_not_enabled 1=Auto_steer_enabled
+  # "ICC_EnbLnChgAsst": 1,          # 0=Auto_steer_not_enabled 1=Auto_steer_enabled -- left to the head unit: on a car
+  #                                 #   without DA coded, forcing it holds ADAS_LCA_Sts in 7 (Error), which lights the
+  #                                 #   ADAS fault telltale (ADAS_SysFltWarnReq 1) the whole drive (2026-11-14 routes 14, 15)
   # "ICC_BSD_Sensitivity": 0,       # 0=Normal 1=Early 2=Late_or_reduced
   # "ICC_DOW_Setting": 2,           # 0=OFF 1=ON_with_Visual 2=ON_with_visual_and_audio
   # "ICC_DCAASetting": 1,           # 0=OFF 1=ON
