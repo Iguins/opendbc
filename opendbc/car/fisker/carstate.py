@@ -4,6 +4,7 @@ from opendbc.car import Bus, structs
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.interfaces import CarStateBase
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
+from opendbc.car.fisker.adasis import RouteTurnTracker
 from opendbc.car.fisker.values import (
   BUTTON_MAP,
   CANBUS,
@@ -18,6 +19,8 @@ from opendbc.car.fisker.values import (
 
 ButtonType = structs.CarState.ButtonEvent.Type
 GearShifter = structs.CarState.GearShifter
+
+BLINKER_HOLD_FRAMES = 60  # 0.6 s at 100 Hz, over the lamp's 0.4 s dark phase
 
 # VCU_GearSig values from DBC VAL_ table
 GEAR_MAP = {
@@ -250,6 +253,9 @@ class CarState(CarStateBase):
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
 
+    # The next turn on the head unit's guided route (adasis.py)
+    self.route_turn = RouteTurnTracker()
+
   def _set_mads_arm(self, armed: bool) -> None:
     """Update the MADS-arm state + its Params sidechannel to sunnypilot MADS.
 
@@ -438,9 +444,11 @@ class CarState(CarStateBase):
     ret.seatbeltUnlatched = cp_pt.vl["ACU_0x159"]["ACU_BucSwtStFrntDrvr"] == 1
 
     # ---- Blinkers ----
+    # The BCM's lamp outputs flash (0.4 s on, 0.4 s off; route 00000014). Hold each one over the dark
+    # phase so a blinker reads as one steady signal for lane changes, lane turns and BlinkerPauseLateral.
     bcm335 = cp_pt.vl["BCM_0x335"]
-    ret.leftBlinker = bool(bcm335["BCM_LeTrunLampOutpCmd"])
-    ret.rightBlinker = bool(bcm335["BCM_RiTrunLampOutpCmd"])
+    ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(BLINKER_HOLD_FRAMES, bool(bcm335["BCM_LeTrunLampOutpCmd"]),
+                                                                      bool(bcm335["BCM_RiTrunLampOutpCmd"]))
 
     # ---- Blind spot monitoring ----
     # BSM is authored by the OEM ADAS module on the cam-side bus (Bus.cam = bus 2).
@@ -639,6 +647,11 @@ class CarState(CarStateBase):
     # ---- ICC_0x35B frames relayed to the ADAS module by carcontroller ----
     self.icc_0x35b_frames = get_new_frames(cp_pt, "ICC_0x35B")
 
+    # ---- Next turn on the head unit's guided route, from the ADASIS horizon ----
+    self.route_turn.update(get_new_frames(cp_pt, "ICC_0x250"), get_new_frames(cp_pt, "ICC_0x251"),
+                           get_new_frames(cp_pt, "ICC_0x361"))
+    ret_sp.routeTurn = self.route_turn.next_turn()
+
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.
     sync = cp_pt.vl["GW_Syn_All"]
@@ -678,6 +691,11 @@ class CarState(CarStateBase):
       ("ICC_0x531", 10),
       ("ICC_0x52A", 10),    # ICC settings frame — we spoof this on bus 2 with ICCACCFuncTyp=2
       ("ICC_0x35B", 10),    # ICC SVS/BSD/DOW/APA settings — re-sent on bus 2 with overrides
+      # ADASIS horizon from the ICC (route turns, adasis.py). Never checked for timeouts: the
+      # head unit can restart while driving, and that mustn't fault openpilot.
+      ("ICC_0x250", float('nan')),
+      ("ICC_0x251", float('nan')),
+      ("ICC_0x361", float('nan')),
       ("GW_Syn_All", 2),    # SecOC sync (~3 Hz)
       # Gateway-mirrored body/HMI (also present on ADASBUS)
       ("VCU_0x214", 50),    # gear, accel pedal %, brake

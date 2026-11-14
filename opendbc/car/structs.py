@@ -166,3 +166,15 @@ class CarControlSP:
 @auto_dataclass
 class CarStateSP:
   speedLimit: float = auto_field()
+  routeTurn: 'CarStateSP.RouteTurn' = field(default_factory=lambda: CarStateSP.RouteTurn())
+
+  @auto_dataclass
+  class RouteTurn:
+    # the next turn on the car's own navigation route, for cars that report one
+    direction: 'CarStateSP.RouteTurn.Direction' = field(default_factory=lambda: CarStateSP.RouteTurn.Direction.none)
+    distance: float = auto_field()  # m along the road to the turn point, negative once past it
+
+    class Direction(StrEnum):
+      none = auto()
+      turnLeft = auto()
+      turnRight = auto()

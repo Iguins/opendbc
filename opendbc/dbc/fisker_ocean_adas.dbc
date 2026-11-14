@@ -257,6 +257,22 @@ BO_ 532 VCU_0x214: 16 GW
  SG_ VCU_214_SSecOC_MAC_Byte1 : 87|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
  SG_ VCU_214_SSecOC_MAC_Byte2 : 95|8@0+ (1,0) [0|255] ""  ADASBUS_Virtual_ECU
 
+BO_ 592 ICC_0x250: 8 GW
+ SG_ ICC_SegOffset : 4|13@0+ (1,0) [0|8190] "m"  ADAS
+ SG_ ICC_SegMsgType : 7|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_SegPathIdx : 21|6@0+ (1,0) [0|63] ""  ADAS
+ SG_ ICC_SegPartOfCalcRoute : 47|2@0+ (1,0) [0|3] ""  ADAS
+
+BO_ 593 ICC_0x251: 8 GW
+ SG_ ICC_StubOffset : 4|13@0+ (1,0) [0|8190] "m"  ADAS
+ SG_ ICC_StubMsgType : 7|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_StubPathIdx : 21|6@0+ (1,0) [0|63] ""  ADAS
+ SG_ ICC_StubStubPathIdx : 31|6@0+ (1,0) [0|63] ""  ADAS
+ SG_ ICC_StubRelProbb : 39|5@0+ (3.333,0) [0|100] "%"  ADAS
+ SG_ ICC_StubFormOfWay : 43|4@0+ (1,0) [0|15] ""  ADAS
+ SG_ ICC_StubPartOfCalcRout : 47|2@0+ (1,0) [0|3] ""  ADAS
+ SG_ ICC_StubTurnAngl : 55|8@0+ (1.417,0) [0|358.583] "degrees"  ADAS
+
 BO_ 787 ADAS_0x313: 8 ADAS
  SG_ ADAS_313_CheckSum : 7|8@0+ (1,0) [0|255] ""  FCM,GW
  SG_ ADAS_313_AliveCounter : 11|4@0+ (1,0) [0|14] ""  FCM,GW
@@ -505,6 +521,11 @@ BO_ 859 ICC_0x35B: 8 GW
  SG_ ICC_RAP_Setting : 59|2@0+ (1,0) [0|3] ""  ADAS
  SG_ ICC_TP_Setting : 61|2@0+ (1,0) [0|3] ""  ADAS
  SG_ ICC_BSD_Sensitivity : 63|2@0+ (1,0) [0|3] ""  ADAS
+
+BO_ 865 ICC_0x361: 8 GW
+ SG_ ICC_PosnOffset : 4|13@0+ (1,0) [0|8190] "m"  ADAS
+ SG_ ICC_PosnMsgTye : 7|3@0+ (1,0) [0|7] ""  ADAS
+ SG_ ICC_PosnPathldx : 21|6@0+ (1,0) [0|63] ""  ADAS
 
 BO_ 1300 MFS_0x514: 8 GW
  SG_ MFS_0x514_CheckSum : 7|8@0+ (1,0) [0|255] ""  ADAS
@@ -3460,6 +3481,9 @@ VAL_ 859 ICC_LKA_SettingWrnTyp 0 "Audio_Visual_and_Haptic" 1 "Visual_and_Audio" 
 VAL_ 859 ICC_RAP_Setting 0 "Remote_Automated_Parking_Disabled" 1 "Remote_Automated_Parking_Enabled" 2 "Reserved" 3 "Reserved" ;
 VAL_ 859 ICC_TP_Setting 0 "Trained_Parking_Disabled" 1 "Trained_Parking_Enabled" 2 "Reserved" 3 "Reserved" ;
 VAL_ 859 ICC_BSD_Sensitivity 0 "Normal" 1 "Early" 2 "Late_or_reduced" 3 "Reserved" ;
+VAL_ 592 ICC_SegPartOfCalcRoute 0 "Segment_is_not_part_of_Calculated_Route" 1 "Segment_is_part_of_Calculated_Route" 2 "Unknown" 3 "Invalid" ;
+VAL_ 593 ICC_StubPartOfCalcRout 0 "New_path_from_this_point_on_is_not_part_of_Calculated_Route" 1 "New_path_from_this_point_on_is_part_of_Calculated_Route" 2 "Unknown" 3 "Invalid" ;
+VAL_ 593 ICC_StubFormOfWay 0 "Unknown" 1 "Freeway" 2 "Multiple_Carriageway" 3 "Single_Carriageway" 4 "Roundabout_Circle" 5 "Traffic_Square" 8 "Parallel_Road" 9 "Freeway_Ramp" 10 "Ramp" 11 "Service_Road" 12 "Car_Park_Entrance" 13 "Service_Entrance" 14 "Pedestrian_Zone" 15 "Invalid" ;
 VAL_ 1300 MFS_LeBtnNorth 0 "No_Pressed" 1 "Pressed" 2 "Long_Press" 3 "Reserved" ;
 VAL_ 1300 MFS_LeBtnSouth 0 "No_Pressed" 1 "Pressed" 2 "Long_Press" 3 "Reserved" ;
 VAL_ 1300 MFS_LeBtnWest 0 "No_Pressed" 1 "Pressed" 2 "Long_Press" 3 "Reserved" ;

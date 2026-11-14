@@ -97,6 +97,19 @@ def _feed_1d0(cs, parsers, packer, frames):
 
 
 class TestCarstate(unittest.TestCase):
+  def test_blinker_steady_across_lamp_flashes(self):
+    # The BCM lamp output flashes 0.4 s on / 0.4 s off; carState must read one steady blinker until it stops.
+    CS, parsers, packer = make_carstate()
+    seen = []
+    for lamp in ([1] * 40 + [0] * 40) * 3 + [0] * 61:
+      frame = packer.make_can_msg("BCM_0x335", CANBUS.pt, {"BCM_RiTrunLampOutpCmd": lamp})
+      for cp in parsers.values():
+        cp.update([(0, [frame])])
+      ret, _ = CS.update(parsers)
+      seen.append((ret.leftBlinker, ret.rightBlinker))
+    assert all(s == (False, True) for s in seen[:240])
+    assert seen[-1] == (False, False)
+
   @parameterized("acc_state", ACC_STATES)
   def test_cruise_state_from_adas_acc(self, acc_state):
     ret = run_carstate(acc_state, 100, mph=False)
