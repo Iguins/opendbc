@@ -1,7 +1,9 @@
+from collections import deque
+
 import numpy as np
 
 from opendbc.can import CANPacker
-from opendbc.car import Bus, structs
+from opendbc.car import DT_CTRL, Bus, structs
 from opendbc.car.carlog import carlog
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.lateral import apply_std_steer_angle_limits
@@ -10,7 +12,10 @@ from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG,
                                         CarControllerParams, ICC_0x35B_OVERRIDES,
-                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED)
+                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED,
+                                        STEER_BIAS_GAIN, STEER_BIAS_MAX, STEER_BIAS_MAX_ANGLE,
+                                        STEER_BIAS_MAX_ERROR, STEER_BIAS_MAX_RATE, STEER_BIAS_MIN_SPEED,
+                                        STEER_BIAS_RATE_WINDOW, STEER_BIAS_SETTLE_TICKS)
 from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 
 
@@ -181,6 +186,14 @@ class CarController(CarControllerBase):
     self._prev_steer_angle = 0.0        # for the settle angle-rate check
     self._angle_override_latch = False  # measured wheel diverged far from command -> driver steering
 
+    # Learned EPS tracking correction, added to the commanded angle (see STEER_BIAS_* in
+    # values.py). Kept for the whole drive, across engagements.
+    self.steer_bias = 0.0
+    self._bias_steady_ticks = 0          # consecutive ticks of steady, active steering
+    # Angles meant for the wheel (sent minus bias) over the last STEER_BIAS_RATE_WINDOW s. The
+    # command moves in 20 Hz model steps, so its rate is judged over the window, not per tick.
+    self._bias_intended = deque(maxlen=round(STEER_BIAS_RATE_WINDOW / DT_CTRL) + 1)
+
     # ICC 0x52A spoof: emit ONE frame per OEM tick (detected by AliveCounter change).
     # ICC broadcasts at ~10 Hz while we control at 100 Hz, so a naive tx-every-tick
     # would emit ~10 duplicates per OEM tick — the receiver's E2E monotonic-counter
@@ -253,6 +266,28 @@ class CarController(CarControllerBase):
     addr, data, bus = msg
     stamped = stamp_secoc(self.secoc_key, can_id, data, trip, reset, msg_counter)
     return addr, stamped, bus
+
+  def _learn_steer_bias(self, measured_deg: float) -> None:
+    """Integrate the gap between the angle meant for the wheel last tick and where it is now,
+    only after a second of steady active steering on a near-straight, slowly moving command."""
+    hist = self._bias_intended
+    if self._bias_steady_ticks < STEER_BIAS_SETTLE_TICKS or len(hist) < hist.maxlen:
+      return
+    intended = hist[-1]
+    rate = abs(intended - hist[0]) / ((len(hist) - 1) * DT_CTRL)
+    err = intended - measured_deg
+    if abs(intended) > STEER_BIAS_MAX_ANGLE or rate > STEER_BIAS_MAX_RATE or abs(err) > STEER_BIAS_MAX_ERROR:
+      return
+    self.steer_bias = float(np.clip(self.steer_bias + STEER_BIAS_GAIN * DT_CTRL * err, -STEER_BIAS_MAX, STEER_BIAS_MAX))
+
+  def _record_steer_bias_tick(self, steady: bool) -> None:
+    """Remember what this tick meant the wheel to reach, for the next ticks' learning steps."""
+    if not steady:
+      self._bias_steady_ticks = 0
+      self._bias_intended.clear()
+      return
+    self._bias_steady_ticks += 1
+    self._bias_intended.append(self.apply_angle_last - self.steer_bias)
 
   def _remote_steer_override(self, planner_angle_deg: float, v_ego: float, now_nanos: int) -> float:
     """If the phone remote-control app is armed AND fresh AND we're below the low-speed
@@ -442,8 +477,10 @@ class CarController(CarControllerBase):
     # slewing to the measured angle at the normal rate while ACC or MADS still permits
     # control, so Panda's rate check keeps accepting the frames; with neither permission
     # it carries the measured angle as the heartbeat.
+    # The learned tracking correction goes on the target, so the limiter still bounds the step.
+    self._learn_steer_bias(CS.out.steeringAngleDeg)
     self.apply_angle_last = apply_fisker_steer_angle_limits(
-      desired_angle_deg, self.apply_angle_last, CS.out.vEgoRaw,
+      desired_angle_deg + self.steer_bias, self.apply_angle_last, CS.out.vEgoRaw,
       CS.out.steeringAngleDeg, lat_active, engaged,
     )
 
@@ -563,6 +600,10 @@ class CarController(CarControllerBase):
       # rejected every following frame of the slew too, and the EPS aborted (AbortFb=8) ~100 ms
       # later. From here on panda's reference is our own last frame, so full steps pass.
       self.apply_angle_last = CS.out.steeringAngleDeg
+
+    self._record_steer_bias_tick(tx_lateral and lat_active and self.was_tx_lateral_prev
+                                 and CS.eps_lat_sts == 2 and not CS.out.steeringPressed
+                                 and not self._remote_active and CS.out.vEgoRaw > STEER_BIAS_MIN_SPEED)
 
     # ---- SecOC + alive counter: seed once at the block moment, then free-run +1 ----
     # We become OEM's exact continuation. On the first TX after an idle gap (the

@@ -265,3 +265,19 @@ SETTLE_MAX_TICKS = 150    # ~1.5 s
 # OVERRIDE_DEG, release once the wheel is back within RELEASE_DEG of the command.
 ANGLE_OVERRIDE_DEG = 30.0          # deg
 ANGLE_OVERRIDE_RELEASE_DEG = 10.0  # deg
+
+# Steering tracking correction. The EPS holds the wheel short of the commanded angle, to the
+# right: measured minus sent was -1.05, -1.05 and -0.69 deg near straight on routes 13-15
+# (2026-11-13/14), steady at every speed, and ~6% short in curves. With the learned angle
+# offset at -2.3 deg the car drifted right until the model's lane pull made up the missing
+# degree, so it sat 0.2-0.6 m right of the lane center. A slow integral on the gap between the
+# intended and measured angle, learned only while steering steadily, is added to the command so
+# the wheel ends up where sunnypilot asked.
+STEER_BIAS_MAX = 2.0            # deg, below the 2.5 deg sent-vs-requested saturation threshold
+STEER_BIAS_GAIN = 0.2           # 1/s: corrects 20% of the remaining gap per second
+STEER_BIAS_MIN_SPEED = 8.0      # m/s
+STEER_BIAS_MAX_ANGLE = 10.0     # deg: learn on straights and gentle curves only
+STEER_BIAS_MAX_RATE = 2.0       # deg/s of commanded angle: the wheel lags a moving command
+STEER_BIAS_RATE_WINDOW = 0.25   # s over which that rate is judged (the command moves in 20 Hz steps)
+STEER_BIAS_MAX_ERROR = 3.0      # deg: a bigger gap is a transient or the driver
+STEER_BIAS_SETTLE_TICKS = 100   # ~1 s of steady active steering before learning

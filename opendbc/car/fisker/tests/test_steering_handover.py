@@ -11,7 +11,8 @@ from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
-                                        OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES)
+                                        OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES, STEER_BIAS_MAX,
+                                        STEER_BIAS_MIN_SPEED)
 from opendbc.car.lateral import apply_std_steer_angle_limits
 from opendbc.car.fisker.values import CarControllerParams
 from opendbc.testing import parameterized
@@ -31,6 +32,26 @@ def _make_car():
   sp = CarInterface.get_non_essential_params_sp(cp, CAR.FISKER_OCEAN)
   cs = CarState(cp, sp)
   return cp, sp, cs
+
+
+def _steering_session(desired, measured, speed=20.0):
+  """A controller already transmitting with the EPS Active, mid-session."""
+  cp, sp, cs = _make_car()
+  controller = CarController(DBC[CAR.FISKER_OCEAN], cp, sp)
+  controller.secoc_key_verified = True
+  controller.secoc_key = bytes(16)
+  controller.was_lat_engaged_prev = True
+  controller.was_lat_active_prev = True
+  controller.was_tx_lateral_prev = True
+  controller.engage_delay_remaining = 0
+  controller.apply_angle_last = measured
+  cs.out = structs.CarState(steeringAngleDeg=measured, vEgoRaw=speed)
+  cs.eps_lat_sts = 2
+  cc = structs.CarControl(latActive=True)
+  cc.actuators.steeringAngleDeg = desired
+  cc_sp = structs.CarControlSP()
+  cc_sp.mads.active = True
+  return controller, cs, cc, cc_sp
 
 
 def candidate_wires(frames):
@@ -81,6 +102,29 @@ class TestSteeringHandover(unittest.TestCase):
 
   def test_disabled_heartbeat_matches_measured_angle(self):
     assert apply_fisker_steer_angle_limits(50, 20, 15, -10, False, False) == -10
+
+  @parameterized('eps_offset, bias', [(-1.05, 1.05), (0.7, -0.7), (-2.6, STEER_BIAS_MAX)])
+  def test_learns_eps_tracking_offset(self, eps_offset, bias):
+    # Routes 13-15 (2026-11-13/14): the EPS held the wheel ~1 deg right of the sent angle at every
+    # speed, so the car sat 0.2-0.6 m right of the lane center. The learned correction must put the
+    # measured wheel on the requested angle (within its clamp), carried in the sent angle.
+    desired = -2.3
+    controller, cs, cc, cc_sp = _steering_session(desired, desired + eps_offset)
+    for _ in range(3000):
+      _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
+      cs.out.steeringAngleDeg = candidate_angle(frames) + eps_offset
+    assert abs(controller.steer_bias - bias) < 0.05
+    assert abs(candidate_angle(frames) - (desired + controller.steer_bias)) <= 0.0625
+
+  @parameterized('pressed, speed, eps_sts', [(True, 20.0, 2), (False, STEER_BIAS_MIN_SPEED - 1, 2), (False, 20.0, 1)])
+  def test_steer_bias_held_unless_steering_steadily(self, pressed, speed, eps_sts):
+    controller, cs, cc, cc_sp = _steering_session(0.0, -3.0, speed)
+    controller.steer_bias = 0.5
+    cs.out.steeringPressed = pressed
+    cs.eps_lat_sts = eps_sts
+    for _ in range(300):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller.steer_bias == 0.5
 
   @parameterized('cruise', [False, True])
   def test_disengagement_fade_respects_remaining_permission(self, cruise):
