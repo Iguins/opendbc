@@ -167,6 +167,7 @@ class CarControlSP:
 class CarStateSP:
   speedLimit: float = auto_field()
   routeTurn: 'CarStateSP.RouteTurn' = field(default_factory=lambda: CarStateSP.RouteTurn())
+  steeringYielded: bool = auto_field()  # lateral engaged, but the port has stopped steering and left the wheel to the driver
 
   @auto_dataclass
   class RouteTurn:

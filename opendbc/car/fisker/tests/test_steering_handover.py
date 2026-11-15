@@ -9,7 +9,7 @@ from opendbc.car.fisker.carcontroller import (CarController, LAT_CANDIDATE_ADDR,
                                               apply_fisker_steer_angle_limits)
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.interface import CarInterface
-from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
+from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_HANDS_OFF_FRAMES, ANGLE_OVERRIDE_RELEASE_DEG, CANBUS, CAR,
                                         DBC, OVERRIDE_RELEASE_FRAMES, OVERRIDE_RELEASE_TORQUE,
                                         OVERRIDE_STEER_TORQUE, OVERRIDE_TRIP_FRAMES, STEER_BIAS_MAX,
                                         STEER_BIAS_MIN_SPEED)
@@ -221,6 +221,36 @@ class TestSteeringHandover(unittest.TestCase):
     cs.out.steeringAngleDeg = 5.0 + ANGLE_OVERRIDE_RELEASE_DEG - 2.0  # wheel back near command
     controller.update(cc.as_reader(), cc_sp, cs, 0)
     assert not controller._angle_override_latch                      # -> resume
+
+  def test_model_target_jump_keeps_steering(self):
+    # Route 00000017 (2026-11-14): at 10-16 km/h the model's target swung 35-60 deg ahead of the wheel in
+    # a tight turn; comparing the wheel to that target yielded and stopped steering for 9 s. The wheel
+    # following our own rate-limited command, even with the EPS lagging it, is not the driver.
+    controller, cs, cc, cc_sp = _steering_session(0.0, 0.0, speed=4.0)
+    sent = [0.0] * 10
+    for target in [60.0] * 150 + [-60.0] * 150:
+      cc.actuators.steeringAngleDeg = target
+      _, frames = controller.update(cc.as_reader(), cc_sp, cs, 0)
+      assert not controller._angle_override_latch
+      sent.append(candidate_angle(frames))
+      cs.out.steeringAngleDeg = sent[-10]  # the wheel 0.1 s behind what we sent
+    assert abs(sent[-1] + 60.0) < 1.0
+    assert not cs.steering_yielded
+
+  @parameterized('settled_wheel, released', [(0.0, True), (-120.0, False)])
+  def test_yield_releases_when_hands_off(self, settled_wheel, released):
+    controller, cs, cc, cc_sp = _steering_session(50.0, 0.0, speed=4.0)
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    cs.out.steeringAngleDeg = -40.0   # the driver turns the wheel away from what we sent
+    cs.out.steeringTorque = -2.0
+    controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller._angle_override_latch and cs.steering_yielded
+    cs.out.steeringAngleDeg = settled_wheel  # then lets go, far from the model's 50 deg
+    cs.out.steeringTorque = 0.0
+    for _ in range(ANGLE_OVERRIDE_HANDS_OFF_FRAMES + 1):
+      controller.update(cc.as_reader(), cc_sp, cs, 0)
+    assert controller._angle_override_latch != released
+    assert cs.steering_yielded != released
 
   def test_torque_override_yields_below_eps_threshold(self):
     car = _make_car()

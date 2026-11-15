@@ -255,6 +255,8 @@ class CarState(CarStateBase):
 
     # The next turn on the head unit's guided route (adasis.py)
     self.route_turn = RouteTurnTracker()
+    # Set by carcontroller while it has stopped steering and left the wheel to the driver
+    self.steering_yielded = False
 
   def _set_mads_arm(self, armed: bool) -> None:
     """Update the MADS-arm state + its Params sidechannel to sunnypilot MADS.
@@ -651,6 +653,7 @@ class CarState(CarStateBase):
     self.route_turn.update(get_new_frames(cp_pt, "ICC_0x250"), get_new_frames(cp_pt, "ICC_0x251"),
                            get_new_frames(cp_pt, "ICC_0x361"))
     ret_sp.routeTurn = self.route_turn.next_turn()
+    ret_sp.steeringYielded = self.steering_yielded
 
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.

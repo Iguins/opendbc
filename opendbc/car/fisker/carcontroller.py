@@ -10,8 +10,9 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
-from opendbc.car.fisker.values import (ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_RELEASE_DEG,
-                                        CarControllerParams, ICC_0x35B_OVERRIDES,
+from opendbc.car.fisker.values import (ANGLE_OVERRIDE_AUTO_RELEASE_MAX, ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_HANDS_OFF_FRAMES,
+                                        ANGLE_OVERRIDE_RELEASE_DEG, ANGLE_OVERRIDE_WINDOW,
+                                        CarControllerParams, ICC_0x35B_OVERRIDES, OVERRIDE_RELEASE_TORQUE,
                                         SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED,
                                         STEER_BIAS_GAIN, STEER_BIAS_MAX, STEER_BIAS_MAX_ANGLE,
                                         STEER_BIAS_MAX_ERROR, STEER_BIAS_MAX_RATE, STEER_BIAS_MIN_SPEED,
@@ -185,6 +186,8 @@ class CarController(CarControllerBase):
     self._settle_hold = 0               # ticks left to wait for the wheel to stop self-centering
     self._prev_steer_angle = 0.0        # for the settle angle-rate check
     self._angle_override_latch = False  # measured wheel diverged far from command -> driver steering
+    self._sent_angles = deque(maxlen=ANGLE_OVERRIDE_WINDOW)  # angles sent on the last lateral TX ticks
+    self._hands_off_frames = 0          # ticks with the driver's hands off and the wheel steady
 
     # Learned EPS tracking correction, added to the commanded angle (see STEER_BIAS_* in
     # values.py). Kept for the whole drive, across engagements.
@@ -433,15 +436,21 @@ class CarController(CarControllerBase):
     # session and feed the EPS with Req=0, same as a driver-override pause).
     # Not while the phone is steering: remote control is for parking, at walking pace or stopped.
     standstill_pause = CS.out.vEgoRaw < STANDSTILL_PAUSE_SPEED and not self._remote_active
-    # Angle-divergence override: measured wheel far from the commanded angle (the model's, or the
-    # phone's while it steers) => the driver is steering independently (hard manual input the
-    # torque yield missed because the EPS was assisting). Yield instead of commanding into it.
-    # Latch with hysteresis so it holds through the maneuver and clears once the wheel is back
-    # near the command.
-    angle_diverge = abs(CS.out.steeringAngleDeg - desired_angle_deg)
-    if angle_diverge > ANGLE_OVERRIDE_DEG:
-      self._angle_override_latch = True
-    elif angle_diverge < ANGLE_OVERRIDE_RELEASE_DEG:
+    # Angle-divergence override: the measured wheel far past every angle we sent recently (ours, or the
+    # phone's while it steers) => the driver is steering independently (hard manual input the torque
+    # yield missed because the EPS was assisting). Yield instead of commanding into it. Latch so it
+    # holds through the maneuver; release when the wheel is back near the target, or when the driver
+    # has let go and the wheel has settled (see ANGLE_OVERRIDE_* in values.py).
+    wheel = CS.out.steeringAngleDeg
+    if self._sent_angles:
+      outside = max(min(self._sent_angles) - wheel, wheel - max(self._sent_angles), 0.0)
+      if outside > ANGLE_OVERRIDE_DEG:
+        self._angle_override_latch = True
+    hands_off = abs(CS.out.steeringTorque) < OVERRIDE_RELEASE_TORQUE and abs(wheel - self._prev_steer_angle) <= SETTLE_ANGLE_STEP
+    self._hands_off_frames = self._hands_off_frames + 1 if hands_off else 0
+    if self._angle_override_latch and (abs(wheel - desired_angle_deg) < ANGLE_OVERRIDE_RELEASE_DEG or
+                                       (self._hands_off_frames >= ANGLE_OVERRIDE_HANDS_OFF_FRAMES and
+                                        abs(wheel) < ANGLE_OVERRIDE_AUTO_RELEASE_MAX)):
       self._angle_override_latch = False
     lat_active = (CC.latActive and secoc_ok and not CS.driver_intervening
                   and not standstill_pause and not self._angle_override_latch)
@@ -600,6 +609,14 @@ class CarController(CarControllerBase):
       # rejected every following frame of the slew too, and the EPS aborted (AbortFb=8) ~100 ms
       # later. From here on panda's reference is our own last frame, so full steps pass.
       self.apply_angle_last = CS.out.steeringAngleDeg
+
+    if tx_lateral:
+      self._sent_angles.append(self.apply_angle_last)
+    else:
+      self._sent_angles.clear()
+    # The wheel is the driver's alone (we've stopped sending) while the session is engaged: carstate
+    # reports it so sunnypilot tells the driver (CarStateSP.steeringYielded).
+    CS.steering_yielded = lat_engaged and (self._angle_override_latch or self._override_eps_recovery)
 
     self._record_steer_bias_tick(tx_lateral and lat_active and self.was_tx_lateral_prev
                                  and CS.eps_lat_sts == 2 and not CS.out.steeringPressed

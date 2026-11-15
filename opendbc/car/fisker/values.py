@@ -257,14 +257,22 @@ STANDSTILL_PAUSE_SPEED = 0.447  # m/s
 SETTLE_ANGLE_STEP = 0.2   # deg/tick
 SETTLE_MAX_TICKS = 150    # ~1.5 s
 
-# Angle-divergence override: when the measured wheel is turned this far (deg) from the angle
-# the model is commanding, the driver is clearly steering independently (hard manual input /
-# U-turn) even if column torque stayed under OVERRIDE_STEER_TORQUE because the EPS was power-
-# assisting the turn. Yield rather than keep commanding into it (on-vehicle 2026-10-27 that
-# caused a near-full-lock EPS abort=9 and a permanent LKAS fault). Hysteresis: latch on at
-# OVERRIDE_DEG, release once the wheel is back within RELEASE_DEG of the command.
-ANGLE_OVERRIDE_DEG = 30.0          # deg
-ANGLE_OVERRIDE_RELEASE_DEG = 10.0  # deg
+# Angle-divergence override: when the measured wheel is this far (deg) past every angle we sent
+# over the last ANGLE_OVERRIDE_WINDOW ticks, the driver is clearly steering independently (hard
+# manual input / U-turn) even if column torque stayed under OVERRIDE_STEER_TORQUE because the EPS
+# was power-assisting the turn. Yield rather than keep commanding into it (on-vehicle 2026-10-27
+# that caused a near-full-lock EPS abort=9 and a permanent LKAS fault). The reference is what we
+# sent, not the model's target: in tight turns the target jumps far ahead of the wheel on its own,
+# and on route 00000017 (2026-11-14) that yielded for 9 s near a parked car and for a whole guided
+# left turn while the UI still showed steering on. The window covers the EPS lagging a fast command.
+# Release once the wheel is back within RELEASE_DEG of the target, or once the driver's hands are
+# off (under OVERRIDE_RELEASE_TORQUE) with the wheel steady for HANDS_OFF_FRAMES within
+# AUTO_RELEASE_MAX of center; the resume path then re-grabs from where the wheel is.
+ANGLE_OVERRIDE_DEG = 30.0               # deg
+ANGLE_OVERRIDE_RELEASE_DEG = 10.0       # deg
+ANGLE_OVERRIDE_WINDOW = 20              # ticks (0.2 s)
+ANGLE_OVERRIDE_HANDS_OFF_FRAMES = 50    # 0.5 s
+ANGLE_OVERRIDE_AUTO_RELEASE_MAX = 90.0  # deg: no automatic re-grab near full lock
 
 # Steering tracking correction. The EPS holds the wheel short of the commanded angle, to the
 # right: measured minus sent was -1.05, -1.05 and -0.69 deg near straight on routes 13-15
