@@ -14,8 +14,6 @@
 //   TX  0x117  ADAS long control status   plain E2E, Sts/Typ (CC -> ACC transition)
 //   TX  0x118  ADAS long/ESP handshake    plain E2E, ESP-side mirror + jerk/prefill/AEB
 //   TX  0x52A  ICC settings spoof         bus 2 (to ADAS); plain E2E — see below
-//   TX  0x5D0  0x1D0 candidates           bus 1, buffered for fisker_fwd_modify, never sent
-//   TX  0x521  0x121 candidates           bus 1, stop assist only (see below), never sent
 //   RX  0x115  wheel speeds -> vehicle_moving
 //   RX  0x318  vehicle speed + brake pedal
 //   RX  0x1C2  EPS steering angle
@@ -107,7 +105,7 @@ typedef struct {
   uint8_t byte4;     // on-wire counter+reset-flag this candidate was stamped for
   uint8_t alive;     // E2E AliveCounter this candidate was stamped for
   uint32_t rx_ts;    // when captured
-  bool ok;           // passed its actuator check at capture (0x1D0: steer_angle_cmd_checks)
+  bool angle_ok;     // angle passed steer_angle_cmd_checks at capture
   bool used;         // slot holds a candidate
 } FiskerCandidate;
 
@@ -115,9 +113,8 @@ typedef struct {
 static FiskerCandidate fisker_cand[64][FISKER_CAND_SLOTS];
 static uint32_t fisker_cand_last_rx = 0U;
 
-// E2E AliveCounter, byte 1 low nibble on both 0x1D0 and 0x121
-static uint8_t fisker_get_alive(const uint8_t *data) {
-  return data[1] & 0x0FU;
+static uint8_t fisker_get_alive_1d0(const CANPacket_t *msg) {
+  return msg->data[1] & 0x0FU;
 }
 
 static bool fisker_cand_fresh(const FiskerCandidate *c) {
@@ -126,8 +123,8 @@ static bool fisker_cand_fresh(const FiskerCandidate *c) {
 
 // The slot for a new candidate: the one already holding the same byte 4 + alive, else an
 // empty or stale one, else the oldest.
-static FiskerCandidate *fisker_cand_slot(FiskerCandidate pool[64][FISKER_CAND_SLOTS], uint8_t byte4, uint8_t alive) {
-  FiskerCandidate *slots = pool[(byte4 >> 2) & 0x3FU];
+static FiskerCandidate *fisker_cand_slot(uint8_t byte4, uint8_t alive) {
+  FiskerCandidate *slots = fisker_cand[(byte4 >> 2) & 0x3FU];
   FiskerCandidate *pick = NULL;
   for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
     if (slots[i].used && (slots[i].byte4 == byte4) && (slots[i].alive == alive)) {
@@ -152,36 +149,6 @@ static FiskerCandidate *fisker_cand_slot(FiskerCandidate pool[64][FISKER_CAND_SL
     }
   }
   return pick;
-}
-
-// Buffer one candidate frame in its pool.
-static FiskerCandidate *fisker_cand_store(FiskerCandidate pool[64][FISKER_CAND_SLOTS], const CANPacket_t *msg, bool ok) {
-  FiskerCandidate *c = fisker_cand_slot(pool, msg->data[4], fisker_get_alive(msg->data));
-  for (int i = 0; i < 8; i++) {
-    c->data[i] = msg->data[i];
-  }
-  c->byte4 = msg->data[4];
-  c->alive = fisker_get_alive(msg->data);
-  c->rx_ts = microsecond_timer_get();
-  c->ok = ok;
-  c->used = true;
-  return c;
-}
-
-// The fresh candidate stamped for exactly this OEM frame: the FULL byte 4 (wire counter AND
-// reset flag), so a candidate from the wrong GW-reset window is never emitted, and the alive
-// counter, so the receiver's E2E sequence continues OEM's. NULL if there is none.
-static const FiskerCandidate *fisker_cand_find(FiskerCandidate pool[64][FISKER_CAND_SLOTS], const CANPacket_t *oem) {
-  const FiskerCandidate *slots = pool[(oem->data[4] >> 2) & 0x3FU];
-  const FiskerCandidate *c = NULL;
-  for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
-    if (fisker_cand_fresh(&slots[i]) && (slots[i].byte4 == oem->data[4]) &&
-        (slots[i].alive == fisker_get_alive(oem->data))) {
-      c = &slots[i];
-      break;
-    }
-  }
-  return c;
 }
 
 static bool fisker_cand_armed(void) {
@@ -222,68 +189,6 @@ static void fisker_update_cruise(void) {
     engaged = engaged || fisker_cc_engaged(fisker_vcu_cc_state, false);
   }
   pcm_cruise_check(engaged);
-}
-
-// ---- Stop assist: lower the car's own ACC request (0x121, bus 2 -> VCU) --------------------
-// With FISKER_FLAG_STOP_ASSIST (the FiskerStopAssist toggle) the car's own ACC (the "Hydra")
-// keeps driving, and sunnypilot only slows the car for a red light or stop sign its driving
-// model sees. The Hydra's ACC brakes and accelerates through 0x121 alone (route 00000015). Like
-// steering, openpilot ships a window of fully-stamped 0x121 payloads as 0x521 on bus 1 (buffered,
-// never sent), and fisker_fwd_modify swaps the one matching the Hydra's counters in for the
-// Hydra's own frame on its way to the VCU, only when ALL of these hold:
-//  * ACC Active (ADAS_Sts_ACC_ICC 3: not Override, not a standstill state) and controls allowed
-//  * both frames ADAS_LgtCtrl_AccelVld Valid
-//  * the candidate asks for LESS acceleration than the Hydra: it can only ever take some away
-//  * the candidate is no lower than -2.0 m/s^2 (sunnypilot itself goes down to -1.5)
-//  * it is at most 0.1 m/s^2 (10 m/s^3) below the last value forwarded, or below the last
-//    candidate forwarded within 250 ms, so a missed frame resumes where it left off
-// Otherwise the Hydra's own frame goes through untouched, as it does with the toggle off.
-#define FISKER_ACCEL_CANDIDATE_ADDR  0x521U
-#define FISKER_STOP_ACCEL_FLOOR      28677    // -2.0 m/s^2
-#define FISKER_STOP_ACCEL_STEP       205      //  0.1 m/s^2 per 10 ms frame
-#define FISKER_STOP_RESUME_US        250000U
-#define FISKER_ACC_STATE_ACTIVE      3
-static bool fisker_stop_assist = false;
-static FiskerCandidate fisker_accel_cand[64][FISKER_CAND_SLOTS];
-static uint32_t fisker_accel_cand_last_rx = 0U;
-static int fisker_accel_last_fwd = FISKER_ACCEL_MAX;   // raw accel of the last 0x121 to the VCU
-static int fisker_accel_last_sub = FISKER_ACCEL_MAX;   // raw accel of the last candidate to the VCU
-static uint32_t fisker_accel_last_sub_ts = 0U;
-static bool fisker_accel_sub_seen = false;
-
-static int fisker_get_accel(const uint8_t *data) {
-  return (data[2] << 8) | data[3];          // ADAS_LgtCtrl_AccelReq 23|16
-}
-
-static bool fisker_accel_valid(const uint8_t *data) {
-  return ((data[1] >> 4) & 0x03U) == 1U;     // ADAS_LgtCtrl_AccelVld 13|2: 1 = Valid
-}
-
-static void fisker_stop_assist_modify(CANPacket_t *to_send) {
-  uint32_t now = microsecond_timer_get();
-  int oem_accel = fisker_get_accel(to_send->data);
-  int emitted = oem_accel;
-  bool armed = safety_get_ts_elapsed(now, fisker_accel_cand_last_rx) < FISKER_CAND_ARM_US;
-  if (armed && controls_allowed && (fisker_adas_cc_state == FISKER_ACC_STATE_ACTIVE) && fisker_accel_valid(to_send->data)) {
-    const FiskerCandidate *c = fisker_cand_find(fisker_accel_cand, to_send);
-    if ((c != NULL) && c->ok) {
-      int accel = fisker_get_accel(c->data);
-      int ref = fisker_accel_last_fwd;
-      if (fisker_accel_sub_seen && (safety_get_ts_elapsed(now, fisker_accel_last_sub_ts) < FISKER_STOP_RESUME_US)) {
-        ref = SAFETY_MIN(ref, fisker_accel_last_sub);
-      }
-      if ((accel < oem_accel) && (accel >= (ref - FISKER_STOP_ACCEL_STEP))) {
-        for (int i = 0; i < 8; i++) {
-          to_send->data[i] = c->data[i];
-        }
-        emitted = accel;
-        fisker_accel_last_sub = accel;
-        fisker_accel_last_sub_ts = now;
-        fisker_accel_sub_seen = true;
-      }
-    }
-  }
-  fisker_accel_last_fwd = emitted;
 }
 
 // ---- ADAS dash warning filter (0x317, bus 2 -> cluster) ----------------------------
@@ -738,27 +643,25 @@ static bool fisker_tx_hook(const CANPacket_t *msg) {
   // receive. So once buffered, the candidate is REJECTED (tx = false) and never reaches
   // the wire — fisker_fwd_modify is the only consumer. The cost is one rejected-frame
   // echo per candidate in the host's can stream. A candidate whose angle fails the check
-  // is buffered with ok=false and will be skipped (gap), never emitted.
+  // is buffered as angle_ok=false and will be skipped (gap), never emitted.
   if ((msg->addr == FISKER_LAT_CANDIDATE_ADDR) && (msg->bus == 1U)) {
     int raw_angle = (msg->data[2] << 8) | msg->data[3];
     int desired_angle = raw_angle - FISKER_ANGLE_ZERO_CAN;
     bool angle_ok = !steer_angle_cmd_checks(desired_angle, controls_allowed || controls_allowed_lateral, FISKER_STEERING_LIMITS);
-    const FiskerCandidate *c = fisker_cand_store(fisker_cand, msg, angle_ok);
+    FiskerCandidate *c = fisker_cand_slot(msg->data[4], fisker_get_alive_1d0(msg));
+    for (int i = 0; i < 8; i++) {
+      c->data[i] = msg->data[i];
+    }
+    c->byte4 = msg->data[4];
+    c->alive = fisker_get_alive_1d0(msg);
+    c->rx_ts = microsecond_timer_get();
+    c->angle_ok = angle_ok;
+    c->used = true;
     fisker_cand_last_rx = c->rx_ts;
     // Candidates keep the lateral relay fresh too (they mean "we're steering"), so OEM's
     // 0x1C0 stays blocked bus 2 -> bus 0 while we inject our own 0x1C0.
     fisker_lat_tx_last = c->rx_ts;
     tx = false;  // panda-internal: never transmit onto the radar link
-  }
-
-  // 0x121 candidate pool for stop assist (0x521 on bus 1; only in the TX list with the stop
-  // assist flag). Buffered and rejected like 0x5D0; fisker_stop_assist_modify does the checks
-  // against the Hydra's own frame.
-  if ((msg->addr == FISKER_ACCEL_CANDIDATE_ADDR) && (msg->bus == 1U)) {
-    bool accel_ok = fisker_accel_valid(msg->data) && (fisker_get_accel(msg->data) >= FISKER_STOP_ACCEL_FLOOR);
-    const FiskerCandidate *c = fisker_cand_store(fisker_accel_cand, msg, accel_ok);
-    fisker_accel_cand_last_rx = c->rx_ts;
-    tx = false;
   }
 
   // ICC settings spoof (0x52A, bus 2): record the TX timestamp so the fwd_hook knows
@@ -816,18 +719,25 @@ static bool fisker_fwd_modify(CANPacket_t *to_send) {
     fisker_fixup_mfs(to_send);
   }
   if ((to_send->addr == 0x1D0U) && (to_send->bus == 2U) && fisker_cand_armed()) {
-    // worst case is a one-frame gap, never a bad MAC or counter
-    const FiskerCandidate *c = fisker_cand_find(fisker_cand, to_send);
-    if ((c != NULL) && c->ok) {
+    const FiskerCandidate *slots = fisker_cand[(to_send->data[4] >> 2) & 0x3FU];
+    const FiskerCandidate *c = NULL;
+    // Match the FULL byte 4 (wire counter AND reset flag) so a candidate from the wrong
+    // GW-reset window is never emitted, and the alive counter so the EPS's E2E sequence
+    // continues OEM's — worst case is a one-frame gap, not a bad MAC or counter.
+    for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
+      if (fisker_cand_fresh(&slots[i]) && (slots[i].byte4 == to_send->data[4]) &&
+          (slots[i].alive == fisker_get_alive_1d0(to_send))) {
+        c = &slots[i];
+        break;
+      }
+    }
+    if ((c != NULL) && c->angle_ok) {
       for (int i = 0; i < 8; i++) {
         to_send->data[i] = c->data[i];
       }
     } else {
       emit = false;  // armed but nothing valid to send this frame -> gap
     }
-  }
-  if ((to_send->addr == 0x121U) && (to_send->bus == 2U) && fisker_stop_assist) {
-    fisker_stop_assist_modify(to_send);
   }
   return emit;
 }
@@ -859,14 +769,6 @@ static safety_config fisker_init(uint16_t param) {
     {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
     {0x35B, 2, 8, .check_relay = false},                                    // ICC SVS/BSD/APA settings (bus 2)
   };
-  static const CanMsg FISKER_STOP_ASSIST_TX_MSGS[] = {
-    {0x1D0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // steering angle (fwd path; see fisker_fwd_modify)
-    {0x5D0, 1, 8, .check_relay = false},                                    // 0x1D0 candidate pool (buffered, then rejected: never sent on bus 1)
-    {0x521, 1, 8, .check_relay = false},                                    // 0x121 candidate pool (stop assist; same)
-    {0x1C0, 0, 8, .check_relay = true, .disable_static_blocking = true},    // lateral activation
-    {0x52A, 2, 8, .check_relay = false},                                    // ICC settings spoof (bus 2)
-    {0x35B, 2, 8, .check_relay = false},                                    // ICC SVS/BSD/APA settings (bus 2)
-  };
 
   // ADAS_0x313 on bus 2 (cam side) is the ADAS ACC state (ADAS_Sts_ACC_ICC), the cruise source since we
   // spoof ICC_0x52A into ADAS ACC mode. MFS_0x514 (MFSS buttons) carries MFS_RiBtnSouth, the MADS trigger.
@@ -888,9 +790,6 @@ static safety_config fisker_init(uint16_t param) {
   // by an explicit developer opt-in.
   const uint16_t FISKER_FLAG_LONGITUDINAL_CONTROL = 1;
   fisker_longitudinal = GET_FLAG(param, FISKER_FLAG_LONGITUDINAL_CONTROL);
-  // Stop assist only makes sense with the car's own ACC driving
-  const uint16_t FISKER_FLAG_STOP_ASSIST = 4;
-  fisker_stop_assist = GET_FLAG(param, FISKER_FLAG_STOP_ASSIST) && !fisker_longitudinal;
   const uint16_t FISKER_PARAM_SP_VCU_BASIC_CRUISE = 1;
   fisker_vcu_basic_cruise = GET_FLAG(current_safety_param_sp, FISKER_PARAM_SP_VCU_BASIC_CRUISE);
   // ADASIS META fix-up: bits 1-2 speed-limit unit, bits 3-4 traffic side, bits 5-14 country
@@ -919,17 +818,11 @@ static safety_config fisker_init(uint16_t param) {
   fisker_south_replay = 0U;
   // No candidates carry over from a previous safety mode init.
   fisker_cand_last_rx = 0U;
-  fisker_accel_cand_last_rx = 0U;
   for (uint32_t w = 0U; w < 64U; w++) {
     for (uint32_t i = 0U; i < FISKER_CAND_SLOTS; i++) {
       fisker_cand[w][i].used = false;
-      fisker_accel_cand[w][i].used = false;
     }
   }
-  fisker_accel_last_fwd = FISKER_ACCEL_MAX;   // until the Hydra's first frame, nothing can pass the step check
-  fisker_accel_last_sub = FISKER_ACCEL_MAX;
-  fisker_accel_last_sub_ts = 0U;
-  fisker_accel_sub_seen = false;
   fisker_vcu_cc_state = 0;
 
   // Initialize the ICC relay tracker. Seeding to "now" opens its window immediately so
@@ -953,25 +846,15 @@ static safety_config fisker_init(uint16_t param) {
       {.msg = {{0x358, 0, 8,  10U, .ignore_checksum = true, .ignore_counter = true, .ignore_quality_flag = true}, { 0 }, { 0 }}},  // VCU basic CC state
     };
     // cppcheck-suppress knownConditionTrueFalse
-    if (fisker_longitudinal) {
-      ret = BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_LONG_TX_MSGS);
-    } else if (fisker_stop_assist) {
-      ret = BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_STOP_ASSIST_TX_MSGS);
-    } else {
-      ret = BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_TX_MSGS);
-    }
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_LONG_TX_MSGS)
+                              : BUILD_SAFETY_CFG(fisker_vcu_cruise_rx_checks, FISKER_TX_MSGS);
   } else {
     static RxCheck fisker_rx_checks[] = {
       FISKER_COMMON_RX_CHECKS
     };
     // cppcheck-suppress knownConditionTrueFalse
-    if (fisker_longitudinal) {
-      ret = BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS);
-    } else if (fisker_stop_assist) {
-      ret = BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_STOP_ASSIST_TX_MSGS);
-    } else {
-      ret = BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
-    }
+    ret = fisker_longitudinal ? BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_LONG_TX_MSGS)
+                              : BUILD_SAFETY_CFG(fisker_rx_checks, FISKER_TX_MSGS);
   }
   return ret;
 }

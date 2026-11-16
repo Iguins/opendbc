@@ -155,55 +155,11 @@ EPS_0x1C2_SIGNALS = (
 )
 
 
-class Secoc121Counter:
-  """The Hydra's own ADAS_0x121 (ACC accel request) for stop assist: its request, and the counters the carcontroller
-  stamps its candidates for. The full SecOC counter is rebuilt like 0x1D0's in CarState.update: wire wraps
-  counted within a window, which restarts when the frame's own reset flag changes."""
-  STALE_FRAMES = 5  # carstate updates without a frame (50 ms) before the request no longer counts
-
-  def __init__(self):
-    self.accel = 0.0
-    self.valid = False      # ADAS_LgtCtrl_AccelVld Valid, on a frame recent enough to use
-    self.alive = 0
-    self.full_ctr = 0
-    self.reset_flag = 0
-    self._wraps = 0
-    self._wire_last = 0
-    self._rflag_last: int | None = None
-    self._missing = self.STALE_FRAMES
-    self._vld = False
-
-  def update(self, frames: list[dict[str, float]]) -> None:
-    for f in frames:
-      fresh0 = int(f["ADAS_121_SSecOC_Fresh_Byte0"])
-      wire, rflag = (fresh0 >> 2) & 0x3F, fresh0 & 0x3
-      if self._rflag_last is None or rflag != self._rflag_last:
-        self._wraps = 0
-      elif wire < self._wire_last:
-        self._wraps += 1
-      self._wire_last, self._rflag_last = wire, rflag
-      self.reset_flag = rflag
-      self.full_ctr = self._wraps * 64 + wire
-      self.alive = int(f["ADAS_121_AliveCounter"])
-      self.accel = float(f["ADAS_LgtCtrl_AccelReq"])
-    if frames:
-      self._missing = 0
-      self._vld = int(frames[-1]["ADAS_LgtCtrl_AccelVld"]) == 1
-    else:
-      self._missing = min(self._missing + 1, self.STALE_FRAMES)
-    self.valid = self._vld and self._missing < self.STALE_FRAMES
-
-
 class CarState(CarStateBase):
   def __init__(self, CP, CP_SP):
     super().__init__(CP, CP_SP)
     # FiskerBasicCruise: the VCU's basic cruise also counts (cars without ACC coded)
     self.vcu_basic_cruise = bool(CP_SP.flags & FiskerFlagsSP.VCU_BASIC_CRUISE)
-    # FiskerStopAssist: the Hydra's 0x121 is parsed for stop_assist.py, which the carcontroller runs and reports here
-    self.stop_assist = bool(CP_SP.flags & FiskerFlagsSP.STOP_ASSIST)
-    self.hydra_121 = Secoc121Counter()
-    self.acc_state = 0
-    self.stop_assist_state = structs.CarStateSP.StopAssistState.off
     # The gateway mirrors the body/HMI signals (gear, pedal, doors, seatbelt,
     # blinkers, MFSS buttons) onto ADASBUS, so the port reads everything from
     # a single bus (Bus.pt = ADASBUS). No IBUS1 tap is required.
@@ -580,9 +536,6 @@ class CarState(CarStateBase):
     ret.cruiseState.standstill = cc_state in (5, 6, 11)
     ret.cruiseState.speed = vcu_cc_speed if use_vcu else cc_speed
     ret.cruiseState.speedCluster = ret.cruiseState.speed
-    self.acc_state = cc_state
-    if self.stop_assist:
-      self.hydra_121.update(get_new_frames(cp_cam, "ADAS_0x121"))
 
     # ---- Buttons (MFSS) ----
     # Edge-detect per signal with a signal-specific "is pressed" predicate so that e.g.
@@ -701,7 +654,6 @@ class CarState(CarStateBase):
                            get_new_frames(cp_pt, "ICC_0x361"))
     ret_sp.routeTurn = self.route_turn.next_turn()
     ret_sp.steeringYielded = self.steering_yielded
-    ret_sp.stopAssist = self.stop_assist_state
 
     # ---- SecOC sync (GW_Syn_All 0x20) ----
     # Trip counter = 2 bytes BE, Reset counter = 3 bytes BE, MAC = 3 bytes.
@@ -772,10 +724,6 @@ class CarState(CarStateBase):
       ("ADAS_0x1C0", 100),  # ADAS_1C0_AliveCounter
       ("ADAS_0x1D0", 100),  # ADAS_1D0_AliveCounter + ADAS_1D0_SSecOC_Fresh_Byte0
     ]
-    if CP_SP.flags & FiskerFlagsSP.STOP_ASSIST:
-      # The Hydra's accel request + counters for stop assist. No rate check: a missing 0x121 only pauses stop
-      # assist (Secoc121Counter.valid), it mustn't be a CAN error.
-      cam_msgs.append(("ADAS_0x121", float('nan')))
     return {
       Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], pt_msgs, CANBUS.pt),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], cam_msgs, CANBUS.cam),

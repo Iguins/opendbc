@@ -12,7 +12,6 @@ from collections.abc import Callable
 
 from opendbc.car import structs
 from opendbc.car.can_definitions import CanRecvCallable, CanSendCallable
-from opendbc.car.fisker.values import FiskerSafetyFlags
 from opendbc.car.hyundai.values import HyundaiFlags
 from opendbc.car.subaru.values import SubaruFlags
 from opendbc.car.toyota.values import ToyotaSafetyFlags
@@ -186,12 +185,6 @@ def _initialize_fisker(CP: structs.CarParams, CP_SP: structs.CarParamsSP, params
     if int(params_dict.get("FiskerBasicCruise", 0)) == 1:
       CP_SP.flags |= FiskerFlagsSP.VCU_BASIC_CRUISE.value
       CP_SP.safetyParam |= FiskerSafetyFlagsSP.VCU_BASIC_CRUISE
-
-    # FiskerStopAssist: default '0' (off). With the car's own ACC driving, slow for a stop sunnypilot's model
-    # predicts by lowering the ACC's request; panda only accepts that with the flag in the main safety param.
-    if int(params_dict.get("FiskerStopAssist", 0)) == 1 and not CP.openpilotLongitudinalControl:
-      CP_SP.flags |= FiskerFlagsSP.STOP_ASSIST.value
-      CP.safetyConfigs[0].safetyParam |= FiskerSafetyFlags.STOP_ASSIST.value
 
     # The head unit's map metadata (ICC_0x362), which the ADAS reads the unit of speed-limit
     # signs from, is blank on UK cars (km/h, no country), so 30 mph signs set ACC to 30 km/h.
