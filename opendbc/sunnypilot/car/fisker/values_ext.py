@@ -17,6 +17,7 @@ class FiskerFlagsSP(IntFlag):
   ACC_TERRAIN_ON = 2        # FiskerACCTerrain  param (default '0' / off) → flag OFF
   LAT_CTRL_LCA = 4          # FiskerLateralType param (default '0' / LKA) → flag OFF
   VCU_BASIC_CRUISE = 8      # FiskerBasicCruise param (default '0' / off) → flag OFF
+  STOP_ASSIST = 16          # FiskerStopAssist param (default '0' / off) → flag OFF
 
 
 class FiskerSafetyFlagsSP:

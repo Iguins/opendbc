@@ -121,6 +121,9 @@ class FiskerCAN:
     buf[0] = fisker_plain_checksum(addr, buf)
     return addr, bytes(buf), bus
 
+  # 0x121 has its AliveCounter in the same place (11|4)
+  accel_command_with_alive = steering_control_with_alive
+
   def create_lat_control(self, lat_active: bool, counter: int, driver_override: bool = False,
                          lat_ctrl_typ: int = 1, lat_engaged: bool | None = None):
     """ADAS_0x1C0 — lateral-control activation/status, 10 ms cycle (plain E2E checksum,

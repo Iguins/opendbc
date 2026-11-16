@@ -144,6 +144,14 @@ class CarControlSP:
   leadOne: 'LeadData' = field(default_factory=lambda: LeadData())
   leadTwo: 'LeadData' = field(default_factory=lambda: LeadData())
   intelligentCruiseButtonManagement: 'IntelligentCruiseButtonManagement' = field(default_factory=lambda: IntelligentCruiseButtonManagement())
+  stopAssist: 'CarControlSP.StopAssist' = field(default_factory=lambda: CarControlSP.StopAssist())
+
+  @auto_dataclass
+  class StopAssist:
+    # the driving model predicts a stop ahead, for ports where the car's own ACC drives and the port can only
+    # lower its request (Fisker)
+    active: bool = auto_field()
+    accel: float = auto_field()  # m/s², the model's desired acceleration
 
   @auto_dataclass
   class Param:
@@ -168,6 +176,12 @@ class CarStateSP:
   speedLimit: float = auto_field()
   routeTurn: 'CarStateSP.RouteTurn' = field(default_factory=lambda: CarStateSP.RouteTurn())
   steeringYielded: bool = auto_field()  # lateral engaged, but the port has stopped steering and left the wheel to the driver
+  stopAssist: 'CarStateSP.StopAssistState' = field(default_factory=lambda: CarStateSP.StopAssistState.off)
+
+  class StopAssistState(StrEnum):
+    off = auto()
+    slowing = auto()      # lowering the car's own ACC request for a predicted stop
+    brakeToStop = auto()  # still slowing, the driver should brake to finish the stop
 
   @auto_dataclass
   class RouteTurn:
