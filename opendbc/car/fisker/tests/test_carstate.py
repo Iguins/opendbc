@@ -61,13 +61,15 @@ def run_carstate(acc_state: int, set_speed: int, mph: bool, vcu_state: int = 0, 
   return ret
 
 
-def _feed_acc(cs, parsers, packer, states, gear: int = 4):
+def _feed_acc(cs, parsers, packer, states, gear: int = 4, func_typ: int = 2):
   """Feed a sequence of ADAS_Sts_ACC_ICC values (one carState update each) in the given
-  VCU_GearSig and return (available, accFaulted) after each."""
+  VCU_GearSig, with the ADAS on our 0x52A copy (ADAS_ACCFuncTyp 2) unless func_typ says otherwise,
+  and return (available, accFaulted) after each."""
   out = []
   for state in states:
     frames = [
       packer.make_can_msg("ADAS_0x313", CANBUS.cam, {"ADAS_Sts_ACC_ICC": state}),
+      packer.make_can_msg("ADAS_0x31C", CANBUS.cam, {"ADAS_ACCFuncTyp": func_typ}),
       packer.make_can_msg("VCU_0x214", CANBUS.pt, {"VCU_GearSig": gear}),
     ]
     for cp in parsers.values():
@@ -255,6 +257,14 @@ class TestCarstate(unittest.TestCase):
     out += _feed_acc(CS, parsers, packer, [10] * (ACC_STARTUP_GRACE_FRAMES + ACC_FAULT_DEBOUNCE_FRAMES - 1), gear=4)
     assert not any(faulted for _, faulted in out[:-1])
     assert out[-1] == (False, True)
+
+  def test_time_before_the_adas_takes_our_copy_is_not_a_fault(self):
+    # Takeover held or copy paused (values.TAKEOVER_HOLD_FRAMES): driving before the ADAS runs on our
+    # 0x52A copy doesn't use up the start-up grace
+    CS, parsers, packer = make_carstate()
+    out = _feed_acc(CS, parsers, packer, [10] * (ACC_STARTUP_GRACE_FRAMES + ACC_FAULT_DEBOUNCE_FRAMES), gear=4, func_typ=0)
+    out += _feed_acc(CS, parsers, packer, [10] * (ACC_STARTUP_GRACE_FRAMES - 1), gear=4)
+    assert not any(faulted for _, faulted in out)
 
   def test_secoc_full_counter_restarts_cleanly_across_reset(self):
     # The OEM 0x1D0 counter runs 1..102 per window (wire 1..63, wrap to 0..38), then the

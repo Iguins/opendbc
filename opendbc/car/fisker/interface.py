@@ -3,13 +3,18 @@ from opendbc.car.interfaces import CarInterfaceBase
 from opendbc.car.fisker.carcontroller import CarController
 from opendbc.car.fisker.carstate import CarState
 from opendbc.car.fisker.radar_interface import RADAR_HEADER, RadarInterface
-from opendbc.car.fisker.values import CANBUS, CarControllerParams, FiskerSafetyFlags
+from opendbc.car.fisker.values import CANBUS, TAKEOVER_HOLD_FRAMES, CarControllerParams, FiskerSafetyFlags
 
 
 class CarInterface(CarInterfaceBase):
   CarState = CarState
   CarController = CarController
   RadarInterface = RadarInterface
+
+  def ready_to_take_over(self, CS: structs.CarState) -> bool:
+    # Give the ADAS time to finish starting (values.TAKEOVER_HOLD_FRAMES), then take over while stopped
+    assert isinstance(self.CS, CarState)
+    return self.CS.updates >= TAKEOVER_HOLD_FRAMES and CS.standstill
 
   @staticmethod
   def get_pid_accel_limits(CP, CP_SP, current_speed, cruise_speed):

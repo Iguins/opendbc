@@ -9,15 +9,20 @@ ICCACCFuncTyp to 2.
 """
 
 import unittest
+from unittest.mock import patch
 
 from opendbc.can import CANPacker
-from opendbc.car import Bus
+from opendbc.car import Bus, structs
+from opendbc.car.fisker import fiskercan
 from opendbc.car.fisker.fiskercan import (
   FiskerCAN,
   _crc8_j1850,
   fisker_icc_checksum_delta,
 )
-from opendbc.car.fisker.values import CANBUS, CAR, DBC
+from opendbc.car.fisker.interface import CarInterface
+from opendbc.car.fisker.values import (CANBUS, CAR, DBC, ICC_0x52A_OVERRIDES, SPOOF_ADOPT_TIMEOUT_FRAMES, SPOOF_RETRY_FRAMES,
+                                        TAKEOVER_HOLD_FRAMES)
+from opendbc.sunnypilot.car.fisker.values_ext import FiskerFlagsSP
 from opendbc.testing import parameterized
 
 
@@ -341,3 +346,72 @@ class TestIccSpoof(unittest.TestCase):
     vals.update({"ICCACCSwt": 2, "ICCACCFuncTyp": 1})
     _, data, _ = fcan.create_icc_spoof_0x52a(vals, acc_auto_speed=False, overrides={})
     assert (data[4] >> 1) & 0x3 == 2 and (data[4] >> 5) & 0x7 == 1 and data[4] & 0x08 == 0
+
+
+def _make_ci(basic_cruise: bool = False):
+  CP = CarInterface.get_non_essential_params(CAR.FISKER_OCEAN)
+  CP_SP = CarInterface.get_non_essential_params_sp(CP, CAR.FISKER_OCEAN)
+  if basic_cruise:
+    CP_SP.flags |= FiskerFlagsSP.VCU_BASIC_CRUISE.value
+  return CarInterface(CP, CP_SP)
+
+
+def _spoof_ticks(CI, frames: int, taken_at: int | None = None, adas_typ: int = 2) -> list[int]:
+  """Run the carcontroller with an ICC 0x52A tick every 20 frames (5 Hz); the ADAS reports ADAS_ACCFuncTyp
+  `adas_typ` from frame `taken_at` (0 before). Returns the frames a copy went out on."""
+  CI.CS.icc_52a_seen = True
+  CI.CS.icc_52a_values = _icc_signal_defaults()
+  sent = []
+  for f in range(frames):
+    CI.CS.icc_52a_alive = (f // 20) % 15
+    CI.CS.adas_acc_func_typ = adas_typ if taken_at is not None and f >= taken_at else 0
+    _, can_sends = CI.apply(structs.CarControl().as_reader(), structs.CarControlSP(), 0)
+    if any(addr == 0x52A for addr, _, _ in can_sends):
+      sent.append(f)
+  return sent
+
+
+class TestWaitForAdas(unittest.TestCase):
+  def test_copy_keeps_going_once_taken(self):
+    sent = _spoof_ticks(_make_ci(), 6000, taken_at=50)
+    assert sent == list(range(0, 6000, 20))
+
+  def test_copy_paused_until_retry_when_not_taken(self):
+    sent = _spoof_ticks(_make_ci(), 2 * SPOOF_RETRY_FRAMES)
+    first_attempt = [f for f in sent if f < SPOOF_ADOPT_TIMEOUT_FRAMES]
+    assert first_attempt == list(range(0, SPOOF_ADOPT_TIMEOUT_FRAMES, 20))
+    # nothing for SPOOF_RETRY_FRAMES, so the panda lets the ICC's own frame through again
+    assert not [f for f in sent if SPOOF_ADOPT_TIMEOUT_FRAMES <= f < SPOOF_ADOPT_TIMEOUT_FRAMES + SPOOF_RETRY_FRAMES]
+    assert SPOOF_ADOPT_TIMEOUT_FRAMES + SPOOF_RETRY_FRAMES + 20 > min(f for f in sent if f >= SPOOF_ADOPT_TIMEOUT_FRAMES)
+
+  def test_retry_that_is_taken_keeps_going(self):
+    retry = SPOOF_ADOPT_TIMEOUT_FRAMES + SPOOF_RETRY_FRAMES
+    sent = _spoof_ticks(_make_ci(), retry + 3000, taken_at=retry + 50)
+    assert sent[-1] >= retry + 3000 - 20
+    assert len([f for f in sent if f >= retry]) >= 3000 // 20
+
+  def test_never_paused_with_basic_cruise(self):
+    # no ACC coded: the ADAS never runs on the copy
+    assert _spoof_ticks(_make_ci(basic_cruise=True), 1000) == list(range(0, 1000, 20))
+
+  def test_taken_means_the_function_type_our_copy_sets(self):
+    # the web HUD can change the copy's ICCACCFuncTyp (values.ICC_0x52A_OVERRIDES)
+    with patch.object(fiskercan, "ICC_0x52A_OVERRIDES", {**ICC_0x52A_OVERRIDES, "ICCACCFuncTyp": 3}):
+      assert _spoof_ticks(_make_ci(), 1000, taken_at=50, adas_typ=3) == list(range(0, 1000, 20))
+      assert max(_spoof_ticks(_make_ci(), 1000, taken_at=50, adas_typ=2)) < SPOOF_ADOPT_TIMEOUT_FRAMES
+    # a copy that sets no function type can't be told apart from the ICC's own frame: never paused
+    with patch.object(fiskercan, "ICC_0x52A_OVERRIDES", {**ICC_0x52A_OVERRIDES, "ICCACCFuncTyp": 0}):
+      assert _spoof_ticks(_make_ci(), 1000) == list(range(0, 1000, 20))
+
+  def test_takeover_held_until_started_and_stopped(self):
+    CI = _make_ci()
+    packer = CANPacker(DBC[CAR.FISKER_OCEAN][Bus.pt])
+    stopped = [packer.make_can_msg("ESP_0x318", CANBUS.pt, {"ESP_VehSpd": 0})]
+    moving = [packer.make_can_msg("ESP_0x318", CANBUS.pt, {"ESP_VehSpd": 30})]
+    for _ in range(TAKEOVER_HOLD_FRAMES - 1):
+      CS, _ = CI.update([(0, stopped)])
+      assert not CI.ready_to_take_over(CS)
+    CS, _ = CI.update([(0, moving)])
+    assert not CI.ready_to_take_over(CS)
+    CS, _ = CI.update([(0, stopped)])
+    assert CI.ready_to_take_over(CS)

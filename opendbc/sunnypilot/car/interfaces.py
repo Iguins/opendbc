@@ -36,6 +36,10 @@ TorqueFromLateralAccelCallbackTypeTorqueSpace = Callable[[LatControlInputs, stru
 
 
 class CarInterfaceBaseSP:
+  def ready_to_take_over(self, CS: structs.CarState) -> bool:
+    """card keeps the panda in pass-through (the car as stock, the comma off the bus) until this is True."""
+    return True
+
   @staticmethod
   def torque_from_lateral_accel_linear_in_torque_space(latcontrol_inputs: LatControlInputs, torque_params: structs.CarParams.LateralTorqueTuning,
                                                         gravity_adjusted: bool) -> float:

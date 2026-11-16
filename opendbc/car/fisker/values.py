@@ -176,6 +176,18 @@ ICC_0x52A_PASSTHROUGH = frozenset({
 })
 assert not (ICC_0x52A_OVERRIDES.keys() & ICC_0x52A_PASSTHROUGH), "ICC_0x52A pass-through signals can't be overridden"
 
+# Waiting for the ADAS (Hydra) at start-up. On 2026-11-16 four starts in a row had the ADAS never take
+# our 0x52A copy when the comma took the bus over ~9 s after the start, and fault everything 3.2-3.4 s
+# later (U15B087 Loss of Communication with ICC). Taking over with the car on for minutes never did,
+# and on good starts the ADAS takes the copy within 0.6 s (ADAS_ACCFuncTyp -> 2).
+# - card keeps the panda in pass-through (the car as stock) until the car has been on this long and
+#   is stopped, as the takeover cuts the bus for ~35 ms (CarInterface.ready_to_take_over).
+# - If the ADAS hasn't taken the copy this long after the first one, the carcontroller stops sending
+#   it, so the panda lets the ICC's own frame through again 0.5 s later, and tries again later.
+TAKEOVER_HOLD_FRAMES = 3000            # 30 s at 100 Hz
+SPOOF_ADOPT_TIMEOUT_FRAMES = 120       # 1.2 s
+SPOOF_RETRY_FRAMES = 3000              # 30 s
+
 
 # ICC_0x35B: surround-view (SVS) requests + BSD/DOW/DCAA/APA/park-assist/AHBA settings. No E2E
 # (no checksum/counter). Optional: while this dict is empty openpilot leaves 0x35B alone and

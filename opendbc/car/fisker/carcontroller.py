@@ -14,7 +14,8 @@ from opendbc.car.fisker.stop_assist import StopAssist
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_AUTO_RELEASE_MAX, ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_HANDS_OFF_FRAMES,
                                         ANGLE_OVERRIDE_RELEASE_DEG, ANGLE_OVERRIDE_WINDOW,
                                         CarControllerParams, ICC_0x35B_OVERRIDES, OVERRIDE_RELEASE_TORQUE,
-                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, STANDSTILL_PAUSE_SPEED,
+                                        SETTLE_ANGLE_STEP, SETTLE_MAX_TICKS, SPOOF_ADOPT_TIMEOUT_FRAMES, SPOOF_RETRY_FRAMES,
+                                        STANDSTILL_PAUSE_SPEED,
                                         STEER_BIAS_GAIN, STEER_BIAS_MAX, STEER_BIAS_MAX_ANGLE,
                                         STEER_BIAS_MAX_ERROR, STEER_BIAS_MAX_RATE, STEER_BIAS_MIN_SPEED,
                                         STEER_BIAS_RATE_WINDOW, STEER_BIAS_SETTLE_TICKS)
@@ -133,6 +134,43 @@ def apply_fisker_steer_angle_limits(desired_angle, last_angle, speed, measured_a
                                      controls_permitted, CarControllerParams.ANGLE_LIMITS)
 
 
+class IccSpoofWatchdog:
+  """Pauses the 0x52A copy when the ADAS doesn't take it (values.SPOOF_ADOPT_TIMEOUT_FRAMES after the
+  first copy of an attempt), so the panda lets the ICC's own frame through again, and starts a new
+  attempt SPOOF_RETRY_FRAMES later. Taken = ADAS_ACCFuncTyp shows the function type our copy sets.
+  Once the ADAS has taken it, or when the copy sets no function type to tell by, the copy always goes out."""
+
+  def __init__(self, enabled: bool):
+    self.adopted = not enabled
+    self.attempt_start: int | None = None
+    self.resume_frame = 0
+    self.failed_attempts = 0
+    self.func_typ: int | None = None  # ICCACCFuncTyp in our last copy
+
+  def allowed(self, frame: int, adas_func_typ: int) -> bool:
+    if self.adopted:
+      return True
+    if self.attempt_start is None:
+      return frame >= self.resume_frame
+    if adas_func_typ == self.func_typ:
+      self.adopted = True
+      return True
+    if frame - self.attempt_start < SPOOF_ADOPT_TIMEOUT_FRAMES:
+      return True
+    self.attempt_start = None
+    self.resume_frame = frame + SPOOF_RETRY_FRAMES
+    self.failed_attempts += 1
+    carlog.error(f"Fisker: ADAS did not take the ICC 0x52A copy (attempt {self.failed_attempts}), pausing it")
+    return False
+
+  def sent(self, frame: int, func_typ: int) -> None:
+    self.func_typ = func_typ
+    if func_typ == 0:
+      self.adopted = True
+    if not self.adopted and self.attempt_start is None:
+      self.attempt_start = frame
+
+
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP, CP_SP):
     super().__init__(dbc_names, CP, CP_SP)
@@ -206,6 +244,8 @@ class CarController(CarControllerBase):
     # would emit ~10 duplicates per OEM tick — the receiver's E2E monotonic-counter
     # validator would flag those as replays and reject them.
     self.last_spoofed_icc_alive = -1
+    # Cars without ACC coded (VCU basic cruise) never show the ADAS taking the copy.
+    self.icc_spoof_watchdog = IccSpoofWatchdog(enabled=not (CP_SP.flags & FiskerFlagsSP.VCU_BASIC_CRUISE.value))
     # EPS_0x1C2 spoof: same cadence rule (one spoof per real OEM tick, ~50 Hz).
     self.last_spoofed_eps_1c2_alive = -1
 
@@ -850,7 +890,10 @@ class CarController(CarControllerBase):
     # Panda's fisker_fwd_hook blocks the OEM's bus-0 -> bus-2 forwarding of 0x52A
     # whenever openpilot has recently emitted its own copy (time-gated, not
     # controls_allowed-gated — same reason as above).
-    if CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
+    #
+    # IccSpoofWatchdog pauses the copy if the ADAS doesn't take it (see values.SPOOF_ADOPT_TIMEOUT_FRAMES).
+    spoof_allowed = self.icc_spoof_watchdog.allowed(self.frame, CS.adas_acc_func_typ)
+    if spoof_allowed and CS.icc_52a_seen and CS.icc_52a_alive != self.last_spoofed_icc_alive:
       # Honor the sunnypilot UI toggles:
       #   FiskerACCAutoSpeed → ACC_AUTO_SPEED_OFF flag → clears byte-4 bit 35
       #   FiskerACCTerrain   → ACC_TERRAIN_ON flag    → sets byte-6 bit 0
@@ -858,10 +901,10 @@ class CarController(CarControllerBase):
       # ICC_0x52A_OVERRIDES (edited live from the web HUD) goes on top and wins.
       acc_auto_speed = not bool(self.CP_SP.flags & FiskerFlagsSP.ACC_AUTO_SPEED_OFF.value)
       terrain_setting = bool(self.CP_SP.flags & FiskerFlagsSP.ACC_TERRAIN_ON.value)
-      can_sends.append(self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values,
-                                                        acc_auto_speed=acc_auto_speed,
-                                                        terrain_setting=terrain_setting))
+      spoof = self.fcan.create_icc_spoof_0x52a(CS.icc_52a_values, acc_auto_speed=acc_auto_speed, terrain_setting=terrain_setting)
+      can_sends.append(spoof)
       self.last_spoofed_icc_alive = CS.icc_52a_alive
+      self.icc_spoof_watchdog.sent(self.frame, func_typ=(spoof[1][4] >> 5) & 0x7)  # ICCACCFuncTyp 39|3
 
     # ---- HUD ----
     # Forwarding intercept: the OEM ADAS module stays alive on bus 2 and the panda

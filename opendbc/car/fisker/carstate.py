@@ -91,7 +91,9 @@ ACC_FAULT_DEBOUNCE_FRAMES = 50
 # 0x52A spoof, and often until the car has been through P once: 10 to 35 s, through D shifts too
 # (2026-11-13 routes 0000000d, 00000012). Until ACC has reached Standby once since openpilot
 # started, 9/10 means "still starting": unavailable, not a fault. If it never comes up, it is a
-# fault after this long in a forward gear.
+# fault after this long in a forward gear with the ADAS on our copy (ADAS_ACCFuncTyp set, not
+# Default_no_function): before that the takeover is still held (TAKEOVER_HOLD_FRAMES) or the spoof
+# watchdog paused the copy.
 ACC_STARTUP_GRACE_FRAMES = 6000  # 60 s
 ACC_READY_STATES = (2, 3, 4, 5, 6, 7, 8, 11)  # Standby and every state past it
 
@@ -293,6 +295,8 @@ class CarState(CarStateBase):
     self._acc_failure_frames = 0      # consecutive updates with ACC in a Failure state (9/10)
     self._acc_ready_seen = False      # ACC has reached Standby (or beyond) since openpilot started
     self._acc_startup_frames = 0      # updates in a forward gear with ACC failing before it was ever ready
+    self.updates = 0                  # carState updates since start (100 Hz), for the takeover hold
+    self.adas_acc_func_typ = 0        # ADAS_ACCFuncTyp: the function type of our 0x52A copy once the ADAS has taken it
 
     # Button state edge detection
     self._prev_button_state = {sig: 0 for sig in BUTTON_SIGNAL_TO_TYPE}
@@ -327,6 +331,7 @@ class CarState(CarStateBase):
     cp_cam = can_parsers[Bus.cam]
     ret = structs.CarState()
     ret_sp = structs.CarStateSP()
+    self.updates += 1
 
     # ---- Speed (wheel speeds + cluster) ----------------------------------
     wsf = cp_pt.vl["ESP_0x115"]
@@ -537,6 +542,7 @@ class CarState(CarStateBase):
     adas313 = cp_cam.vl["ADAS_0x313"]
     adas31c = cp_cam.vl["ADAS_0x31C"]
     cc_state = int(adas313["ADAS_Sts_ACC_ICC"])
+    self.adas_acc_func_typ = int(adas31c["ADAS_ACCFuncTyp"])
     cc_disp = adas31c["ADAS_AccTrgSpdDisp"]
     cc_speed = 0.0 if cc_disp >= 255 else cc_disp * icc_to_ms
 
@@ -562,7 +568,8 @@ class CarState(CarStateBase):
     acc_failure = cc_state in (9, 10) or vcu_cc_state in (9, 10)
     if cc_state in ACC_READY_STATES or vcu_cc_state in (2, 3, 4):
       self._acc_ready_seen = True
-    if acc_failure and not not_forward and not self._acc_ready_seen:
+    on_our_copy = self.adas_acc_func_typ != 0 or self.vcu_basic_cruise
+    if acc_failure and not not_forward and not self._acc_ready_seen and on_our_copy:
       self._acc_startup_frames += 1
     acc_starting = not self._acc_ready_seen and self._acc_startup_frames < ACC_STARTUP_GRACE_FRAMES
     self._acc_failure_frames = self._acc_failure_frames + 1 if acc_failure and not not_forward and not acc_starting else 0
