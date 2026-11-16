@@ -114,10 +114,22 @@ class CarControllerParams:
   ACCEL_SCALE = 0.0004882
   ACCEL_OFFSET = -16.0
 
+  # Stop assist (FiskerStopAssist): the car's own ACC keeps driving and the port only lowers its 0x121
+  # request when sunnypilot's model predicts a stop. See stop_assist.py and fisker_stop_assist_modify in
+  # safety/modes/fisker.h, which forwards the ACC's own frame unless ours asks for less, by at most
+  # 0.1 m/s² more per frame, down to -2.0.
+  STOP_ASSIST_ACCEL_MIN = -1.5            # m/s², the most braking it asks for
+  STOP_ASSIST_JERK_DOWN = 2.5             # m/s³ going onto the stop
+  STOP_ASSIST_JERK_UP = 1.5               # m/s³ handing back to the ACC's own request
+  STOP_ASSIST_MIN_SPEED = 15 / 3.6        # m/s: a stop starts above this...
+  STOP_ASSIST_MAX_SPEED = 80 / 3.6        # ...and below this
+  STOP_ASSIST_HANDOFF_SPEED = 12 / 3.6    # m/s: below it the driver brakes to stop, and it no longer lets go by itself
+
 
 class FiskerSafetyFlags(IntFlag):
   LONG_CONTROL = 1
   SECOC = 2
+  STOP_ASSIST = 4    # fisker.h FISKER_FLAG_STOP_ASSIST: accept 0x121 candidates (0x521) to lower the ACC's request
 
 
 class FiskerFlags(IntFlag):

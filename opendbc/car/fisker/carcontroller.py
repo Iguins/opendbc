@@ -10,6 +10,7 @@ from opendbc.car.lateral import apply_std_steer_angle_limits
 
 from opendbc.car.fisker.fiskercan import FiskerCAN
 from opendbc.car.fisker.secoc import stamp_secoc, sync_mac
+from opendbc.car.fisker.stop_assist import StopAssist
 from opendbc.car.fisker.values import (ANGLE_OVERRIDE_AUTO_RELEASE_MAX, ANGLE_OVERRIDE_DEG, ANGLE_OVERRIDE_HANDS_OFF_FRAMES,
                                         ANGLE_OVERRIDE_RELEASE_DEG, ANGLE_OVERRIDE_WINDOW,
                                         CarControllerParams, ICC_0x35B_OVERRIDES, OVERRIDE_RELEASE_TORQUE,
@@ -65,6 +66,9 @@ REMOTE_POLL_FRAMES = 10  # re-read the enable gate at ~10 Hz (100 Hz loop)
 # candidate and then rejects it: nothing is ever transmitted there.
 LAT_CANDIDATE_ADDR = 0x5D0   # carries an 0x1D0 payload; panda-internal (never on a real bus)
 LAT_CANDIDATE_BUS = 1        # addressed to the MRR link; panda rejects it after buffering
+# Stop assist: the same scheme for the Hydra's 0x121, to lower its accel request (stop_assist.py)
+ACCEL_CANDIDATE_ADDR = 0x521
+ACC_ACTIVE = 3               # ADAS_Sts_ACC_ICC Active (not Override, not standstill)
 # The window has to cover the whole round trip: OEM frame -> panda -> pandad -> card ->
 # sendcan -> panda. Candidate k is used ~(10*k - latency) ms after it reaches panda, and
 # panda only uses candidates younger than FISKER_CAND_FRESH_US (60 ms). Upstream's -1..+3
@@ -253,6 +257,10 @@ class CarController(CarControllerBase):
     self._remote_poll_frame = -REMOTE_POLL_FRAMES  # force a poll on the first tick
     self._remote_active = False      # the phone's angle is the one commanded this tick
 
+    # FiskerStopAssist: lower the car's own ACC request for a stop the driving model predicts (stop_assist.py)
+    self.stop_assist_enabled = bool(CP_SP.flags & FiskerFlagsSP.STOP_ASSIST) and not CP.openpilotLongitudinalControl
+    self.stop_assist = StopAssist()
+
   def _maybe_verify_key(self, CS) -> None:
     """Verify the stored SecOC key against the GW sync MAC once at startup."""
     if self.secoc_key_verified or not CS.secoc_sync_seen or not self.secoc_key:
@@ -350,6 +358,24 @@ class CarController(CarControllerBase):
       return planner_angle_deg
     self._remote_active = True
     return remote_angle
+
+  def _stop_assist(self, CC, CC_SP, CS, secoc_ok: bool, trip: int, reset: int, can_sends: list) -> None:
+    hydra = CS.hydra_121
+    # CC.enabled: sunnypilot itself engaged. The car's ACC stays on when sunnypilot can't engage or disengages
+    # for a fault (this port never cancels it), and stop assist mustn't act then.
+    allowed = (secoc_ok and CC.enabled and CS.out.cruiseState.enabled and CS.acc_state == ACC_ACTIVE and hydra.valid and
+               not CS.out.gasPressed and not CS.out.brakePressed)
+    request = CC_SP.stopAssist if CC_SP is not None else None
+    stop_accel = self.stop_assist.update(allowed, bool(request is not None and request.active),
+                                         float(request.accel) if request is not None else 0.0, hydra.accel, CS.out.vEgo)
+    CS.stop_assist_state = self.stop_assist.state
+    if stop_accel is None:
+      return
+    accel_base = self.fcan.create_accel_command(stop_accel, True, 0)
+    for secoc_k, alive_k, reset_k in lat_candidates(hydra.full_ctr, hydra.alive, oem_reset_value(reset, hydra.reset_flag)):
+      accel_msg = self.fcan.accel_command_with_alive(accel_base, alive_k)
+      _addr, stamped, _bus = self._stamp(accel_msg, ACCEL_CAN_ID, trip, reset_k, secoc_k)
+      can_sends.append((ACCEL_CANDIDATE_ADDR, stamped, LAT_CANDIDATE_BUS))
 
   def update(self, CC, CC_SP, CS, now_nanos):
     actuators = CC.actuators
@@ -738,6 +764,13 @@ class CarController(CarControllerBase):
       # if self.last_spoofed_eps_1c2_alive != CS.eps_1c2_alive and CS.eps_1c2_values:
       #   can_sends.append(self.fcan.create_eps_spoof_0x1c2(CS.eps_1c2_values))
       #   self.last_spoofed_eps_1c2_alive = CS.eps_1c2_alive
+
+    # ---- Stop assist (0x121 candidates as 0x521 on bus 1 @ 100 Hz) ----
+    # The car's own ACC keeps driving; while sunnypilot's model predicts a stop we ask for less acceleration
+    # than it does (stop_assist.py). Like 0x1D0, a window of signed candidates around the ACC's own counters,
+    # and panda puts the matching one in place of its 0x121 only if it asks for less (fisker_stop_assist_modify).
+    if self.stop_assist_enabled:
+      self._stop_assist(CC, CC_SP, CS, secoc_ok, trip, reset, can_sends)
 
     # ---- Longitudinal (accel 0x121 + status 0x117/0x118 @ 100 Hz) ----
     # Same architecture as lateral (see comment above): send the whole triple across the
